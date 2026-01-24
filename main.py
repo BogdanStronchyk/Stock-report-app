@@ -1,6 +1,7 @@
 import os
 import warnings
 from datetime import datetime
+
 import yfinance as yf
 
 from config import CHECKLIST_FILE
@@ -9,11 +10,13 @@ from input_resolver import resolve_to_ticker
 from metrics import compute_metrics_v2
 from reversal import trend_reversal_scores
 from report_writer import create_report_workbook
+from ui_dialogs import ask_output_directory
+
 
 def main():
     warnings.filterwarnings("ignore")
-    checklist_folder = r"\Checklist"
-    checklist_path = os.path.join(os.getcwd()+checklist_folder, CHECKLIST_FILE)
+
+    checklist_path = os.path.join(os.getcwd()+r"\Checklist", CHECKLIST_FILE)
     thresholds = load_thresholds_from_excel(checklist_path)
 
     print("\n=== Stock Report Generator v2 (Modular) ===")
@@ -52,10 +55,8 @@ def main():
     base = "_".join(tickers)
     filename = f"{base}_{ts}.xlsx"
 
-    print("\nSave location (press ENTER for ./reports):")
-    user_dir = input("Folder path: ").strip()
-
-    out_dir = os.path.abspath(user_dir) if user_dir else os.path.join(os.getcwd(), "reports")
+    # ✅ UI folder picker
+    out_dir = ask_output_directory(default_subfolder="reports")
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, filename)
 
@@ -77,6 +78,7 @@ def main():
     )
 
     print("\n✅ DONE:", out_path)
+
 
 if __name__ == "__main__":
     main()
