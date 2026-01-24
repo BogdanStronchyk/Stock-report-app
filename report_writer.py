@@ -40,7 +40,7 @@ def _extract_numeric_bounds(green_txt: Any, yellow_txt: Any, red_txt: Any) -> Tu
     return (min(lows) if lows else None, max(highs) if highs else None)
 
 
-def _is_aberrant(value: Any, low: Optional[float], high: Optional[float]) -> Tuple[bool, str]:
+def _is_aberrant(metric_name: str, value: Any, low: Optional[float], high: Optional[float]) -> Tuple[bool, str]:
     try:
         if value is None:
             return (False, "")
@@ -53,7 +53,8 @@ def _is_aberrant(value: Any, low: Optional[float], high: Optional[float]) -> Tup
         return (False, "")
 
     if low is None and high is None:
-        if abs(v) > 1e9:
+        big_ok = any(k in (metric_name or "") for k in ["Market Cap", "Enterprise Value", "Avg Daily $ Volume", "Revenue", "Total Assets"])
+        if not big_ok and abs(v) > 1e15:
             return (True, "No meaningful data to calculate this metric (extreme magnitude).")
         return (False, "")
 
@@ -219,7 +220,7 @@ def create_report_workbook(
                     mode = bucket if bucket in thresholds[cat_sheet][metric] else "Default (All)"
 
                     lo, hi = _extract_numeric_bounds(th["green_txt"], th["yellow_txt"], th["red_txt"])
-                    is_bad, bad_msg = _is_aberrant(raw_val, lo, hi)
+                    is_bad, bad_msg = _is_aberrant(metric, raw_val, lo, hi)
                     if is_bad:
                         val = None
                         score = "NA"

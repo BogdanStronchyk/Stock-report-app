@@ -8,8 +8,7 @@ from typing import Any, Dict, Optional
 
 
 class FMPClient:
-    """
-    Financial Modeling Prep fallback client.
+    \"\"\"Financial Modeling Prep fallback client.
 
     IMPORTANT: FMP has *two* URL styles:
       - Legacy v3 style: /api/v3/<endpoint>/<SYMBOL>?period=quarter&limit=...&apikey=...
@@ -18,7 +17,7 @@ class FMPClient:
     This client primarily uses the v3 style for statements and enterprise values,
     because those endpoints are clearly documented with the symbol in the path.
     For TTM ratios/key-metrics, we try v3 first and then stable as a fallback.
-    """
+    \"\"\"
 
 
     def __init__(self, api_key: Optional[str] = None, timeout: int = 25):
@@ -111,15 +110,18 @@ class FMPClient:
     # Fetch bundle
     # -----------------------
     def fetch_all(self, symbol: str) -> Dict[str, Any]:
-        """
-        fetch a small bundle of endpoints used for fallback fills.
-        """
+        \"\"\"Fetch a small bundle of endpoints used for fallback fills.\"\"\"
         if not self.enabled:
             return {}
 
         data: Dict[str, Any] = {}
 
+        # Profile/Quote (v3) for market cap/volume/price fallbacks
+        data["profile"] = self._get_json(self._v3_url("profile", symbol, {})) or []
+        data["quote"] = self._get_json(self._v3_url("quote", symbol, {})) or []
+
         # Statements (v3 format with symbol in path)
+        data["income_a"] = self._get_json(self._v3_url("income-statement", symbol, {"period": "annual", "limit": 6})) or []
         data["income_q"] = self._get_json(self._v3_url("income-statement", symbol, {"period": "quarter", "limit": 8})) or []
         data["cashflow_q"] = self._get_json(self._v3_url("cash-flow-statement", symbol, {"period": "quarter", "limit": 8})) or []
         data["balance_a"] = self._get_json(self._v3_url("balance-sheet-statement", symbol, {"period": "annual", "limit": 2})) or []
