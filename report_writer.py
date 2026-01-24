@@ -179,8 +179,14 @@ def create_report_workbook(
         ws["B4"] = m.get("Price")
         ws["A5"] = "Total Combined Reversal Score %"
         ws["B5"] = revpack.get("combined_score", (0.6*f_score + 0.4*t_score))
+        ws["A6"] = "Data Notes"
+        notes = m.get("__notes__", {})
+        if isinstance(notes, dict):
+            ws["B6"] = "\n".join([f"{k}: {v}" for k, v in notes.items()])
+        else:
+            ws["B6"] = str(notes)
 
-        row = 7
+        row = 8
 
         for cat_sheet, cat_title in category_maps.items():
             ws[f"A{row}"] = cat_title
