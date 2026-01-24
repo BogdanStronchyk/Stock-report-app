@@ -133,7 +133,7 @@ def create_report_workbook(
     ws_sum = wb.create_sheet("Summary", 0)
     ws_sum.append([
         "Ticker", "Sector Bucket", "NUPL Regime", "Composite NUPL",
-        "Fundamental Score %", "Technical Score %",
+        "Fundamental Score %", "Technical Score %", "Total Combined Reversal Score %",
         "Fund Green", "Fund G+Y", "Tech Green", "Tech G+Y"
     ])
     for cell in ws_sum[1]:
@@ -157,11 +157,12 @@ def create_report_workbook(
 
         f_score = revpack.get("fundamental_score", 0.0)
         t_score = revpack.get("technical_score", 0.0)
+        c_score = revpack.get("combined_score", (0.6*f_score + 0.4*t_score))
         counts = revpack.get("counts", {})
 
         ws_sum.append([
             t, bucket, m.get("NUPL Regime"), m.get("Composite NUPL"),
-            f_score, t_score,
+            f_score, t_score, c_score,
             counts.get("fund_green", 0), counts.get("fund_gy", 0),
             counts.get("tech_green", 0), counts.get("tech_gy", 0),
         ])
@@ -176,8 +177,10 @@ def create_report_workbook(
         ws["B3"] = m.get("Yahoo Industry")
         ws["A4"] = "Price"
         ws["B4"] = m.get("Price")
+        ws["A5"] = "Total Combined Reversal Score %"
+        ws["B5"] = revpack.get("combined_score", (0.6*f_score + 0.4*t_score))
 
-        row = 6
+        row = 7
 
         for cat_sheet, cat_title in category_maps.items():
             ws[f"A{row}"] = cat_title

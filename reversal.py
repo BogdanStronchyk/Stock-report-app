@@ -82,11 +82,11 @@ def _atr_percent(hist: pd.DataFrame, period: int = 14) -> Optional[float]:
 def _fund_margin_stabilization(q_income: pd.DataFrame) -> Tuple[int, str]:
     rev = _safe_series(q_income, ["Total Revenue", "TotalRevenue"], 8)
     opi = _safe_series(q_income, ["Operating Income", "OperatingIncome"], 8)
-    gp  = _safe_series(q_income, ["Gross Profit", "GrossProfit"], 8)
+    gp = _safe_series(q_income, ["Gross Profit", "GrossProfit"], 8)
 
     rev_ttm, rev_prev = _ttm_and_prev_ttm(rev) if rev is not None else (None, None)
-    op_ttm, op_prev   = _ttm_and_prev_ttm(opi) if opi is not None else (None, None)
-    gp_ttm, gp_prev   = _ttm_and_prev_ttm(gp)  if gp is not None else (None, None)
+    op_ttm, op_prev = _ttm_and_prev_ttm(opi) if opi is not None else (None, None)
+    gp_ttm, gp_prev = _ttm_and_prev_ttm(gp) if gp is not None else (None, None)
 
     if None in (rev_ttm, rev_prev, op_ttm, op_prev) or rev_ttm in (None, 0) or rev_prev in (None, 0):
         return (0, "Missing quarterly revenue/op income for TTM comparison.")
@@ -111,7 +111,7 @@ def _fund_margin_stabilization(q_income: pd.DataFrame) -> Tuple[int, str]:
 def _fund_cashflow_reversal(q_cf: pd.DataFrame, q_income: pd.DataFrame) -> Tuple[int, str]:
     ocf = _safe_series(q_cf, ["Operating Cash Flow", "Total Cash From Operating Activities"], 8)
     cap = _safe_series(q_cf, ["Capital Expenditure", "CapitalExpenditure"], 8)
-    ni  = _safe_series(q_income, ["Net Income", "NetIncome"], 8)
+    ni = _safe_series(q_income, ["Net Income", "NetIncome"], 8)
 
     ocf_ttm, ocf_prev = _ttm_and_prev_ttm(ocf) if ocf is not None else (None, None)
     cap_ttm, cap_prev = _ttm_and_prev_ttm(cap) if cap is not None else (None, None)
@@ -120,7 +120,7 @@ def _fund_cashflow_reversal(q_cf: pd.DataFrame, q_income: pd.DataFrame) -> Tuple
     if None in (ocf_ttm, ocf_prev, cap_ttm, cap_prev):
         return (0, "Missing cashflow data for TTM FCF.")
 
-    fcf_ttm = ocf_ttm + cap_ttm
+    fcf_ttm = ocf_ttm + cap_ttm  # capex is negative
     fcf_prev = ocf_prev + cap_prev
     improved = fcf_ttm > fcf_prev
 
@@ -128,7 +128,7 @@ def _fund_cashflow_reversal(q_cf: pd.DataFrame, q_income: pd.DataFrame) -> Tuple
     if ocf_ttm is not None and ni_ttm not in (None, 0):
         cfo_ni = ocf_ttm / ni_ttm
 
-    if fcf_ttm > 0 and (improved or fcf_prev <= 0):
+    if fcf_ttm > 0 and (improved or (fcf_prev is not None and fcf_prev <= 0)):
         if cfo_ni is None or cfo_ni >= 1.0:
             return (2, f"FCF positive & improving. CFO/NI={cfo_ni:.2f}" if cfo_ni is not None else "FCF positive & improving.")
         return (1, f"FCF positive but CFO/NI weak ({cfo_ni:.2f}).")
@@ -220,7 +220,7 @@ def _fund_capex_discipline(q_cf: pd.DataFrame, q_income: pd.DataFrame) -> Tuple[
 
 def _fund_revenue_quality(q_income: pd.DataFrame, info: Dict[str, Any]) -> Tuple[int, str]:
     rev = _safe_series(q_income, ["Total Revenue", "TotalRevenue"], 8)
-    gp  = _safe_series(q_income, ["Gross Profit", "GrossProfit"], 8)
+    gp = _safe_series(q_income, ["Gross Profit", "GrossProfit"], 8)
     rev_ttm, rev_prev = _ttm_and_prev_ttm(rev) if rev is not None else (None, None)
 
     if None in (rev_ttm, rev_prev) or rev_prev in (None, 0):
@@ -277,6 +277,8 @@ def _fund_value_divergence(metrics: Optional[Dict[str, Any]]) -> Tuple[int, str]
 # Technical Confirmation (7)
 # ==========================
 def _tech_price_above_200(hist: pd.DataFrame) -> Tuple[int, str]:
+    if hist is None or hist.empty:
+        return (0, "Missing history.")
     close = pd.to_numeric(hist.get("Adj Close", hist.get("Close")), errors="coerce").dropna()
     if close.shape[0] < 210:
         return (0, "Insufficient history for MA200.")
@@ -290,6 +292,8 @@ def _tech_price_above_200(hist: pd.DataFrame) -> Tuple[int, str]:
 
 
 def _tech_ma_structure(hist: pd.DataFrame) -> Tuple[int, str]:
+    if hist is None or hist.empty:
+        return (0, "Missing history.")
     close = pd.to_numeric(hist.get("Adj Close", hist.get("Close")), errors="coerce").dropna()
     if close.shape[0] < 210:
         return (0, "Insufficient history.")
@@ -304,6 +308,8 @@ def _tech_ma_structure(hist: pd.DataFrame) -> Tuple[int, str]:
 
 
 def _tech_breakout_higher_low(hist: pd.DataFrame) -> Tuple[int, str]:
+    if hist is None or hist.empty:
+        return (0, "Missing history.")
     close = pd.to_numeric(hist.get("Adj Close", hist.get("Close")), errors="coerce").dropna()
     if close.shape[0] < 80:
         return (0, "Insufficient history.")
@@ -319,6 +325,8 @@ def _tech_breakout_higher_low(hist: pd.DataFrame) -> Tuple[int, str]:
 
 
 def _tech_rsi(hist: pd.DataFrame) -> Tuple[int, str]:
+    if hist is None or hist.empty:
+        return (0, "Missing history.")
     close = pd.to_numeric(hist.get("Adj Close", hist.get("Close")), errors="coerce").dropna()
     r = _rsi(close, 14)
     if r is None:
@@ -331,7 +339,7 @@ def _tech_rsi(hist: pd.DataFrame) -> Tuple[int, str]:
 
 
 def _tech_volume_accumulation(hist: pd.DataFrame) -> Tuple[int, str]:
-    if "Volume" not in hist.columns:
+    if hist is None or hist.empty or "Volume" not in hist.columns:
         return (0, "Missing volume.")
     close = pd.to_numeric(hist.get("Adj Close", hist.get("Close")), errors="coerce").dropna()
     vol = pd.to_numeric(hist["Volume"], errors="coerce").fillna(0)
@@ -351,6 +359,8 @@ def _tech_volume_accumulation(hist: pd.DataFrame) -> Tuple[int, str]:
 
 
 def _tech_volatility_regime(hist_1y: pd.DataFrame) -> Tuple[int, str]:
+    if hist_1y is None or hist_1y.empty:
+        return (0, "Missing history.")
     atrp = _atr_percent(hist_1y, 14)
     if atrp is None:
         return (0, "ATR% unavailable.")
@@ -373,6 +383,8 @@ def _tech_volatility_regime(hist_1y: pd.DataFrame) -> Tuple[int, str]:
 
 
 def _tech_drawdown_recovery(hist_1y: pd.DataFrame) -> Tuple[int, str]:
+    if hist_1y is None or hist_1y.empty:
+        return (0, "Missing history.")
     close = pd.to_numeric(hist_1y.get("Adj Close", hist_1y.get("Close")), errors="coerce").dropna()
     if close.shape[0] < 200:
         return (0, "Insufficient history.")
@@ -409,6 +421,11 @@ TECH_WEIGHTS = {
     "Volume accumulation": 0.14,
     "Volatility regime": 0.10,
     "Drawdown recovery (52w)": 0.12,
+}
+
+COMBINED_SCORE_WEIGHTS = {
+    "fundamental": 0.60,
+    "technical": 0.40,
 }
 
 
@@ -454,6 +471,10 @@ def trend_reversal_scores(tkr: yf.Ticker, metrics: Optional[Dict[str, Any]] = No
 
     f_score = _weighted_score(fundamental, FUND_WEIGHTS)
     t_score = _weighted_score(technical, TECH_WEIGHTS)
+    combined_score = (
+        f_score * COMBINED_SCORE_WEIGHTS.get("fundamental", 0.5)
+        + t_score * COMBINED_SCORE_WEIGHTS.get("technical", 0.5)
+    )
 
     f_sym = {k: _score_symbol(v[0]) for k, v in fundamental.items()}
     t_sym = {k: _score_symbol(v[0]) for k, v in technical.items()}
@@ -472,5 +493,6 @@ def trend_reversal_scores(tkr: yf.Ticker, metrics: Optional[Dict[str, Any]] = No
         "technical_symbols": t_sym,
         "fundamental_score": f_score,
         "technical_score": t_score,
+        "combined_score": combined_score,
         "counts": counts,
     }
