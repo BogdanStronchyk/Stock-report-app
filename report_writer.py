@@ -1,3 +1,4 @@
+
 from typing import Any, Dict, List, Optional, Tuple
 import math
 
@@ -20,11 +21,10 @@ def autosize(ws):
             if cell.value is None:
                 continue
             max_len = max(max_len, len(str(cell.value)))
-        ws.column_dimensions[col_letter].width = min(max(12, max_len + 2), 58)
+        ws.column_dimensions[col_letter].width = min(max(12, max_len + 2), 60)
 
 
 def _extract_numeric_bounds(green_txt: Any, yellow_txt: Any, red_txt: Any) -> Tuple[Optional[float], Optional[float]]:
-    """Try to infer plausible numeric bounds from checklist text ranges."""
     rules = []
     for txt in (green_txt, yellow_txt, red_txt):
         if txt is None:
@@ -37,18 +37,10 @@ def _extract_numeric_bounds(green_txt: Any, yellow_txt: Any, red_txt: Any) -> Tu
 
     lows = [lo for lo, hi in rules if lo is not None]
     highs = [hi for lo, hi in rules if hi is not None]
-
-    lo = min(lows) if lows else None
-    hi = max(highs) if highs else None
-    return (lo, hi)
+    return (min(lows) if lows else None, max(highs) if highs else None)
 
 
 def _is_aberrant(value: Any, low: Optional[float], high: Optional[float]) -> Tuple[bool, str]:
-    """Detect extreme outliers that almost certainly indicate a data issue.
-
-    We use soft bounds derived from checklist limits and allow a generous multiple,
-    because real-world metrics can be noisy.
-    """
     try:
         if value is None:
             return (False, "")
@@ -60,58 +52,90 @@ def _is_aberrant(value: Any, low: Optional[float], high: Optional[float]) -> Tup
     except Exception:
         return (False, "")
 
-    # If we have no bounds, don't attempt to label as aberrant
     if low is None and high is None:
-        # generic sanity checks only
         if abs(v) > 1e9:
             return (True, "No meaningful data to calculate this metric (extreme magnitude).")
         return (False, "")
 
-    # Reference magnitude for scaling
-    ref_candidates = []
-    if low is not None:
-        ref_candidates.append(abs(low))
-    if high is not None:
-        ref_candidates.append(abs(high))
-    ref = max(ref_candidates + [1.0])
+    ref = max([abs(x) for x in [low, high] if x is not None] + [1.0])
+    MULT = 50.0
 
-    # Allow huge but finite multiples of the expected range
-    MULT = 50.0  # generous buffer; catches -3000 vs -10 type issues
-    # If we have both bounds, also use range-based buffer
     if low is not None and high is not None:
-        span = abs(high - low)
-        span = max(span, ref * 0.05)  # avoid zero span
+        span = max(abs(high - low), ref * 0.05)
         hard_low = low - MULT * span
         hard_high = high + MULT * span
+    elif low is None:
+        hard_low = -MULT * ref
+        hard_high = (high if high is not None else ref) + MULT * ref
     else:
-        # one-sided: create a wide implied corridor around the known bound
-        if low is None:
-            hard_low = -MULT * ref
-            hard_high = (high if high is not None else ref) + MULT * ref
-        else:
-            hard_low = (low if low is not None else -ref) - MULT * ref
-            hard_high = MULT * ref
+        hard_low = (low if low is not None else -ref) - MULT * ref
+        hard_high = MULT * ref
 
     if v < hard_low or v > hard_high:
-        msg = "No meaningful data to calculate this metric (aberrant outlier vs checklist limits)."
-        return (True, msg)
-
+        return (True, "No meaningful data to calculate this metric (aberrant outlier vs checklist limits).")
     return (False, "")
+
+
+def _write_reversal_block(
+    ws,
+    start_row: int,
+    title: str,
+    symbols: Dict[str, str],
+    details: Dict[str, Tuple[int, str]],
+    green_count: int,
+    gy_count: int,
+    score_pct: float
+) -> int:
+    ws[f"A{start_row}"] = title
+    ws.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=6)
+    start_row += 1
+
+    ws.cell(start_row, 1).value = "Condition"
+    ws.cell(start_row, 2).value = "Score"
+    ws.cell(start_row, 3).value = "Details"
+    ws.cell(start_row, 4).value = "Summary"
+    for c in range(1, 5):
+        cell = ws.cell(start_row, c)
+        cell.fill = FILL_HDR
+        cell.font = FONT_HDR
+        cell.alignment = ALIGN_CENTER
+    start_row += 1
+
+    top = start_row
+    for cond, sym in symbols.items():
+        ws.cell(start_row, 1).value = cond
+        ws.cell(start_row, 2).value = sym
+        ws.cell(start_row, 2).fill = FILL_GREEN if sym == "🟢" else (FILL_YELLOW if sym == "🟡" else FILL_RED)
+        ws.cell(start_row, 3).value = details.get(cond, (0, ""))[1]
+        ws.cell(start_row, 3).alignment = ALIGN_WRAP
+        start_row += 1
+
+    ws.cell(top, 4).value = f"Green: {green_count}/{len(symbols)}\nGreen+Yellow: {gy_count}/{len(symbols)}\nWeighted score: {score_pct:.1f}%"
+    ws.cell(top, 4).alignment = ALIGN_WRAP
+
+    for r in range(top, start_row):
+        for c in range(1, 5):
+            ws.cell(r, c).alignment = ALIGN_WRAP
+
+    return start_row + 1
 
 
 def create_report_workbook(
     tickers: List[str],
     thresholds: Dict[str, Dict[str, Dict[str, Any]]],
     metrics_by_ticker: Dict[str, Dict[str, Any]],
-    reversal_by_ticker: Dict[str, Dict[str, str]],
+    reversal_by_ticker: Dict[str, Dict[str, Any]],
     out_path: str
 ):
     wb = Workbook()
     wb.remove(wb.active)
 
-    # Summary sheet
     ws_sum = wb.create_sheet("Summary", 0)
-    ws_sum.append(["Ticker", "Sector Bucket", "NUPL Regime", "Composite NUPL", "Reversal (Green)", "Reversal (G+Y)"])
+    ws_sum.append([
+        "Ticker", "Sector Bucket", "NUPL Regime", "Composite NUPL",
+        "Fundamental Score %", "Technical Score %",
+        "Fund Green", "Fund G+Y", "Tech Green", "Tech G+Y"
+    ])
     for cell in ws_sum[1]:
         cell.fill = FILL_HDR
         cell.font = FONT_HDR
@@ -127,14 +151,20 @@ def create_report_workbook(
 
     for t in tickers:
         m = metrics_by_ticker[t]
-        rev = reversal_by_ticker[t]
+        revpack = reversal_by_ticker[t]
         bucket = m.get("Sector Bucket", "Default (All)")
         metric_notes = m.get("__notes__", {}) if isinstance(m.get("__notes__", {}), dict) else {}
 
-        rev_green = sum(1 for v in rev.values() if v == "🟢")
-        rev_gy = sum(1 for v in rev.values() if v in ("🟢", "🟡"))
+        f_score = revpack.get("fundamental_score", 0.0)
+        t_score = revpack.get("technical_score", 0.0)
+        counts = revpack.get("counts", {})
 
-        ws_sum.append([t, bucket, m.get("NUPL Regime"), m.get("Composite NUPL"), rev_green, rev_gy])
+        ws_sum.append([
+            t, bucket, m.get("NUPL Regime"), m.get("Composite NUPL"),
+            f_score, t_score,
+            counts.get("fund_green", 0), counts.get("fund_gy", 0),
+            counts.get("tech_green", 0), counts.get("tech_gy", 0),
+        ])
 
         ws = wb.create_sheet(t)
         ws["A1"] = f"{t} — Checklist v2 (Sector-adjusted): {bucket}"
@@ -142,16 +172,13 @@ def create_report_workbook(
 
         ws["A2"] = "Yahoo Sector"
         ws["B2"] = m.get("Yahoo Sector")
-
         ws["A3"] = "Yahoo Industry"
         ws["B3"] = m.get("Yahoo Industry")
-
         ws["A4"] = "Price"
         ws["B4"] = m.get("Price")
 
         row = 6
 
-        # Category blocks
         for cat_sheet, cat_title in category_maps.items():
             ws[f"A{row}"] = cat_title
             ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
@@ -170,19 +197,18 @@ def create_report_workbook(
                 raw_val = m.get(metric)
                 th = get_threshold_set(thresholds, cat_sheet, metric, bucket)
 
-                # Base notes from checklist file
                 base_notes = ""
                 limits = ""
                 mode = "Default (All)"
                 score = "NA"
                 fill = FILL_GRAY
+                extra_auto_note = ""
 
                 if th:
                     limits = f"{th['green_txt']} | {th['yellow_txt']} | {th['red_txt']}"
                     base_notes = th.get("notes") or ""
                     mode = bucket if bucket in thresholds[cat_sheet][metric] else "Default (All)"
 
-                    # --- Outlier sanitation (NEW) ---
                     lo, hi = _extract_numeric_bounds(th["green_txt"], th["yellow_txt"], th["red_txt"])
                     is_bad, bad_msg = _is_aberrant(raw_val, lo, hi)
                     if is_bad:
@@ -193,12 +219,9 @@ def create_report_workbook(
                     else:
                         val = raw_val
                         score, fill = score_with_threshold_txt(val, th["green_txt"], th["yellow_txt"], th["red_txt"])
-                        extra_auto_note = ""
                 else:
                     val = raw_val
-                    extra_auto_note = ""
 
-                # Extra computed note from metrics.py (e.g., not meaningful ratios)
                 extra_note = metric_notes.get(metric, "")
 
                 notes = base_notes
@@ -223,30 +246,26 @@ def create_report_workbook(
 
             row += 1
 
-        # Reversal block
-        ws[f"A{row}"] = "Trend Reversal Checklist (7)"
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
-        row += 1
+        fund_sym = revpack.get("fundamental_symbols", {})
+        tech_sym = revpack.get("technical_symbols", {})
+        fund_det = revpack.get("fundamental", {})
+        tech_det = revpack.get("technical", {})
 
-        ws.cell(row, 1).value = "Condition"
-        ws.cell(row, 2).value = "Score"
-        ws.cell(row, 3).value = "Counts"
-        for c in range(1, 4):
-            cell = ws.cell(row, c)
-            cell.fill = FILL_HDR
-            cell.font = FONT_HDR
-            cell.alignment = ALIGN_CENTER
-        row += 1
+        row = _write_reversal_block(
+            ws, row,
+            "Fundamental Turnaround Signals (7)",
+            fund_sym, fund_det,
+            counts.get("fund_green", 0), counts.get("fund_gy", 0),
+            f_score
+        )
 
-        top = row
-        for cond, sym in rev.items():
-            ws.cell(row, 1).value = cond
-            ws.cell(row, 2).value = sym
-            ws.cell(row, 2).fill = FILL_GREEN if sym == "🟢" else (FILL_YELLOW if sym == "🟡" else FILL_RED)
-            row += 1
-
-        ws.cell(top, 3).value = f"Green: {rev_green}/7\nGreen+Yellow: {rev_gy}/7"
-        ws.cell(top, 3).alignment = ALIGN_WRAP
+        row = _write_reversal_block(
+            ws, row,
+            "Technical Confirmation Signals (7)",
+            tech_sym, tech_det,
+            counts.get("tech_green", 0), counts.get("tech_gy", 0),
+            t_score
+        )
 
         autosize(ws)
 

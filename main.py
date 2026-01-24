@@ -1,4 +1,6 @@
+
 import os
+import sys
 import warnings
 from datetime import datetime
 
@@ -15,14 +17,29 @@ from ui_stock_picker import ask_stocks
 from ui_progress import ProgressWindow, success_popup
 
 
+def _resource_path(relative_path: str) -> str:
+    base = getattr(sys, "_MEIPASS", os.path.abspath(os.getcwd()))
+    return os.path.join(base, relative_path)
+
+
+def _find_checklist_file() -> str:
+    candidates = [
+        os.path.join(os.getcwd(), "Checklist", CHECKLIST_FILE),
+        _resource_path(os.path.join("Checklist", CHECKLIST_FILE)),
+        _resource_path(CHECKLIST_FILE),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return candidates[0]
+
+
 def main():
     warnings.filterwarnings("ignore")
 
-    # ✅ Checklist file is inside ./Checklist/
-    checklist_path = os.path.join(os.getcwd(), "Checklist", CHECKLIST_FILE)
+    checklist_path = _find_checklist_file()
     thresholds = load_thresholds_from_excel(checklist_path)
 
-    # ✅ UI stock picker
     raw = ask_stocks()
     if not raw:
         print("Canceled.")
@@ -38,9 +55,7 @@ def main():
         else:
             unresolved.append(p)
 
-    # Deduplicate
-    tickers = []
-    seen = set()
+    tickers, seen = [], set()
     for t in resolved:
         if t not in seen:
             seen.add(t)
@@ -59,12 +74,10 @@ def main():
     base = "_".join(tickers)
     filename = f"{base}_{ts}.xlsx"
 
-    # ✅ UI folder picker
     out_dir = ask_output_directory(default_subfolder="reports")
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, filename)
 
-    # ✅ Progress window
     steps_total = len(tickers) * 2 + 2
     prog = ProgressWindow(total_steps=steps_total, title="Stock Report App — Generating")
 
@@ -78,10 +91,10 @@ def main():
             prog.step(main_text=f"Fetching fundamentals ({i}/{len(tickers)})", sub_text=t)
             metrics_by_ticker[t] = compute_metrics_v2(t)
 
-            prog.step(main_text=f"Checking trend reversal ({i}/{len(tickers)})", sub_text=t)
-            reversal_by_ticker[t] = trend_reversal_scores(yf.Ticker(t))
+            prog.step(main_text=f"Reversal scoring ({i}/{len(tickers)})", sub_text=t)
+            reversal_by_ticker[t] = trend_reversal_scores(yf.Ticker(t), metrics_by_ticker[t])
 
-        prog.step(main_text="Writing Excel report...", sub_text="Applying sector-adjusted checklist + colors")
+        prog.step(main_text="Writing Excel report...", sub_text="Applying checklist + scores + colors")
         create_report_workbook(
             tickers=tickers,
             thresholds=thresholds,
@@ -91,14 +104,10 @@ def main():
         )
         prog.step(main_text="Done!", sub_text=out_path)
 
-    except Exception as e:
+    finally:
         prog.close()
-        raise e
 
-    prog.close()
     print("✅ DONE:", out_path)
-
-    # ✅ Success popup + open folder prompt
     success_popup(out_path)
 
 

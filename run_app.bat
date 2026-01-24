@@ -5,7 +5,7 @@ REM ============================================================
 REM Run StockReportApp.exe (portable launcher)
 REM - Looks for dist\StockReportApp.exe first
 REM - Then tries StockReportApp.exe in current folder
-REM - Provides helpful error messages
+REM - Warns if external Checklist folder is missing (optional)
 REM ============================================================
 
 cd /d "%~dp0"
@@ -32,19 +32,15 @@ echo === Stock Report App Launcher ===
 echo Executable: %cd%\%EXE_PATH%
 echo.
 
-REM If you DID NOT bundle the checklist into the EXE, it must exist next to it.
-REM With the current build_exe.bat, the checklist IS bundled, so this is just a warning.
-if not exist "Fundamental_Checklist_v2_with_sector_adjustments.xlsx" (
-  echo [INFO] Checklist file not found next to launcher:
-  echo        Fundamental_Checklist_v2_with_sector_adjustments.xlsx
-  echo        (This is OK if you built the EXE with --add-data, which bundles it.)
+if not exist "Checklist\Fundamental_Checklist_v2_with_sector_adjustments.xlsx" (
+  echo [INFO] External checklist not found in:
+  echo        %cd%\Checklist\
+  echo        That's OK if the EXE was built with --add-data (bundled checklist).
   echo.
 )
 
-REM Launch the app
 "%EXE_PATH%"
 
-REM If the app exits immediately, keep the window open so you can read messages
 echo.
 echo === App finished ===
 pause
