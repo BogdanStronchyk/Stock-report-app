@@ -1,4 +1,3 @@
-
 import math
 from typing import Any, Dict, List, Optional
 
@@ -227,9 +226,16 @@ def normalize_cycle_proxy(current_price: float, ath: float) -> Optional[float]:
 # Main metrics computation
 # -------------------------------------------------------------------
 def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
-    """Compute checklist metrics + improved compound Stock NUPL v2."""
+    """Compute checklist metrics + improved compound Stock NUPL v2.
+
+    Adds a special key '__notes__' which maps metric name -> note string.
+    report_writer.py will display these notes in the Notes column so that
+    'not meaningful' ratios are explicitly explained.
+    """
     tkr = yf.Ticker(ticker)
     info = tkr.get_info()
+
+    notes: Dict[str, str] = {}
 
     sector = info.get("sector")
     industry = info.get("industry")
@@ -248,7 +254,7 @@ def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
 
     price = float(p5.iloc[-1]) if not p5.empty else safe_get(info, "currentPrice")
 
-    # --- NUPL legacy (now based on Adj Close) ---
+    # --- NUPL legacy (Adj Close) ---
     twap10 = twap(p10)
     twap5 = twap(p5)
     nupl10 = (price - twap10) / price if (price and twap10) else None
@@ -257,7 +263,7 @@ def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
     ath_adj = float(p10.max()) if not p10.empty else None
     cycle_proxy = normalize_cycle_proxy(price, ath_adj) if (price and ath_adj) else None
 
-    # --- NUPL v2: VWAP + turnover-realized price ---
+    # --- NUPL v2 components ---
     vwap10_series = anchored_vwap(p10, h10["Volume"]) if (h10 is not None and not h10.empty and "Volume" in h10.columns) else pd.Series(dtype=float)
     vwap10 = float(vwap10_series.iloc[-1]) if not vwap10_series.empty else None
     nupl_vwap10 = (price - vwap10) / price if (price and vwap10) else None
@@ -267,13 +273,11 @@ def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
     realized_price = float(realized_series.iloc[-1]) if not realized_series.empty else None
     nupl_turnover = (price - realized_price) / price if (price and realized_price) else None
 
-    # Vol-scaled drawdown sigma (optional)
     vol_1y = realized_vol_1y(h1y)
     dd_sigma = None
     if cycle_proxy is not None and vol_1y not in (None, 0):
         dd_sigma = float(cycle_proxy) / (float(vol_1y) / 100.0)
 
-    # Composite raw (kept near -1..+1)
     composite_nupl = None
     weights = {"turn": 0.50, "vwap": 0.30, "cycle": 0.20}
     vals = {"turn": nupl_turnover, "vwap": nupl_vwap10, "cycle": cycle_proxy}
@@ -281,7 +285,6 @@ def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
     if wsum > 0:
         composite_nupl = sum((weights[k] / wsum) * vals[k] for k in weights if vals[k] is not None)
 
-    # Z-score composite (regime-stable)
     z_turn = zscore_last((p10 - realized_series) / p10) if (not p10.empty and not realized_series.empty) else None
     z_vwap = zscore_last((p10 - vwap10_series) / p10) if (not p10.empty and not vwap10_series.empty) else None
     z_cycle = None
@@ -326,18 +329,40 @@ def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
     if ps is None and mcap is not None and ttm_rev not in (None, 0):
         ps = float(mcap) / float(ttm_rev)
 
-    # EV/EBIT
-    ev_ebit = None
-    if ev is not None and annual_income is not None and not annual_income.empty:
-        ebit = None
+    # -------- EV/EBIT (PATCH) --------
+    # Use TTM Operating Income as the primary EBIT proxy to avoid "near-zero annual EBIT" blowups.
+    ttm_ebit = last_n_quarters_sum(q_income, ["Operating Income", "OperatingIncome"], n=4)
+
+    annual_ebit = None
+    if annual_income is not None and not annual_income.empty:
         for k in ["EBIT", "Ebit", "Operating Income", "OperatingIncome"]:
             if k in annual_income.index:
-                ebit = annual_income.loc[k].iloc[0]
+                try:
+                    annual_ebit = float(annual_income.loc[k].iloc[0])
+                except Exception:
+                    annual_ebit = None
                 break
-        if ebit is not None and not pd.isna(ebit) and float(ebit) != 0:
-            ev_ebit = float(ev) / float(ebit)
 
-    earnings_yield = (1.0 / ev_ebit) * 100.0 if ev_ebit not in (None, 0) else None
+    ebit_used = ttm_ebit if ttm_ebit not in (None, 0) else annual_ebit
+
+    ev_ebit = None
+    earnings_yield = None
+
+    if ev in (None, 0) or ebit_used is None:
+        notes["EV/EBIT"] = "No meaningful data to calculate this ratio (missing EV or EBIT proxy)."
+        notes["Earnings Yield (EBIT / EV)"] = "No meaningful data to calculate this ratio (missing EV or EBIT proxy)."
+    elif ebit_used <= 0:
+        # Negative EBIT -> not meaningful for EV/EBIT
+        notes["EV/EBIT"] = "No meaningful data to calculate this ratio (EBIT <= 0)."
+        notes["Earnings Yield (EBIT / EV)"] = "No meaningful data to calculate this ratio (EBIT <= 0)."
+    else:
+        # Tiny EBIT guard (prevents EV/EBIT=3000+ when EBIT is basically ~0)
+        if ttm_rev not in (None, 0) and (float(ebit_used) / float(ttm_rev)) < 0.005:
+            notes["EV/EBIT"] = "No meaningful data to calculate this ratio (EBIT margin < 0.5% → ratio becomes unstable)."
+            notes["Earnings Yield (EBIT / EV)"] = "No meaningful data to calculate this ratio (EBIT margin < 0.5% → inverse becomes unstable)."
+        else:
+            ev_ebit = float(ev) / float(ebit_used)
+            earnings_yield = (1.0 / ev_ebit) * 100.0 if ev_ebit not in (None, 0) else None
 
     # EV/FCF, Price/FCF, FCF Yield
     ev_fcf = float(ev) / float(ttm_fcf) if (ev is not None and ttm_fcf not in (None, 0)) else None
@@ -393,24 +418,19 @@ def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
     nd_ebitda = float(net_debt) / float(ebitda) if (net_debt is not None and ebitda not in (None, 0)) else None
     nd_fcf = float(net_debt) / float(ttm_fcf) if (net_debt is not None and ttm_fcf not in (None, 0)) else None
 
-    # Interest coverage
+    # Interest coverage (use EBIT proxy as well; if EBIT is unstable, this may be unstable too)
     interest_cov = None
     fcf_interest = None
     if annual_income is not None and not annual_income.empty:
-        ebit = None
         interest_exp = None
-        for k in ["EBIT", "Ebit", "Operating Income", "OperatingIncome"]:
-            if k in annual_income.index:
-                ebit = annual_income.loc[k].iloc[0]
-                break
         for k in ["Interest Expense", "InterestExpense"]:
             if k in annual_income.index:
                 interest_exp = annual_income.loc[k].iloc[0]
                 break
-        if ebit is not None and interest_exp is not None and not pd.isna(ebit) and not pd.isna(interest_exp):
+        if interest_exp is not None and not pd.isna(interest_exp):
             denom = abs(float(interest_exp))
-            if denom > 0:
-                interest_cov = float(ebit) / denom
+            if denom > 0 and ebit_used is not None:
+                interest_cov = float(ebit_used) / denom
                 fcf_interest = float(ttm_fcf) / denom if ttm_fcf is not None else None
 
     # Liquidity ratios
@@ -472,6 +492,8 @@ def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
     worst_week_3y = worst_weekly_return_3y(h3y)
 
     return {
+        "__notes__": notes,
+
         "Ticker": ticker,
         "Price": price,
         "Yahoo Sector": sector,
@@ -523,19 +545,19 @@ def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
         "Market Cap": mcap,
         "Worst Weekly Return (3Y)": worst_week_3y,
 
-        # NUPL legacy keys (kept for compatibility)
+        # NUPL legacy keys
         "NUPL10Y": nupl10,
         "NUPL5Y": nupl5,
         "CycleProxy": cycle_proxy,
 
-        # NUPL v2 components (new)
+        # NUPL v2 components
         "NUPL VWAP10 Proxy": nupl_vwap10,
         "NUPL Turnover Proxy": nupl_turnover,
         "Realized Price (Turnover Proxy)": realized_price,
         "VWAP10 (Anchored)": vwap10,
         "Drawdown Sigma (ATH/Vol)": dd_sigma,
 
-        # Composite (report uses these keys)
+        # Composite
         "Composite NUPL": composite_nupl,
         "Composite NUPL Z": composite_z,
         "NUPL Regime": nupl_regime,
