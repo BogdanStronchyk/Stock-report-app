@@ -1,2 +1,2 @@
-# Stock-report-app
-
+# StockReportApp
+Fundamental analysis tool for stock market value analysis
