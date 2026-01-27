@@ -1,5 +1,6 @@
 import math
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -7,21 +8,142 @@ import pandas as pd
 import yfinance as yf
 
 from sector_map import map_sector
+from fmp_provider import FMPClient
 
 
 # -------------------------------------------------------------------
 # Small helpers
 # -------------------------------------------------------------------
-def safe_get(d: Dict[str, Any], key: str) -> Optional[float]:
-    v = d.get(key, None)
-    try:
-        if v is None:
-            return None
-        if isinstance(v, (int, float, np.floating)) and not pd.isna(v):
-            return float(v)
+_MULTIPLIERS = {
+    "K": 1e3,
+    "M": 1e6,
+    "B": 1e9,
+    "T": 1e12,
+}
+
+
+def _to_float(value: Any) -> Optional[float]:
+    """
+    Robust numeric coercion:
+      - accepts Python int/float
+      - accepts numpy numbers (np.integer + np.floating)
+      - accepts strings like '10B', '$250M', '1,234,567', '(123.4)', '15.2%'
+    Returns None if it can't parse or is NaN/Inf.
+    """
+    if value is None:
         return None
+
+    # Fast path: numeric types (including numpy)
+    try:
+        if isinstance(value, (int, float, np.number)):
+            v = float(value)
+            if math.isnan(v) or math.isinf(v):
+                return None
+            return v
+    except Exception:
+        pass
+
+    # Strings
+    if isinstance(value, str):
+        s = value.strip()
+        if not s or s.lower() in {"n/a", "na", "none", "null", "-"}:
+            return None
+
+        neg = False
+        if s.startswith("(") and s.endswith(")"):
+            neg = True
+            s = s[1:-1].strip()
+
+        s = s.replace(" ", "")
+
+        # Strip leading currency/symbols
+        s = re.sub(r"^[^\d\.\-\+]+", "", s)
+
+        # Percent
+        is_percent = s.endswith("%")
+        if is_percent:
+            s = s[:-1]
+
+        # Remove thousands separators
+        s = s.replace(",", "").replace("_", "")
+
+        # Optional suffix multiplier
+        m = re.match(r"^([+-]?\d*\.?\d+)([KMBT])?$", s, re.IGNORECASE)
+        if not m:
+            return None
+
+        try:
+            num = float(m.group(1))
+        except Exception:
+            return None
+
+        suffix = m.group(2)
+        if suffix:
+            num *= _MULTIPLIERS.get(suffix.upper(), 1.0)
+
+        if neg:
+            num = -num
+        if is_percent:
+            num /= 100.0
+
+        if math.isnan(num) or math.isinf(num):
+            return None
+        return num
+
+    return None
+
+
+def safe_get(d: Dict[str, Any], key: str) -> Optional[float]:
+    """
+    Extract numeric value from a dict safely.
+
+    IMPORTANT FIX:
+    Previous version rejected np.integer (e.g., numpy.int64) which yfinance frequently
+    returns for marketCap, enterpriseValue, sharesOutstanding, etc. That cascades into
+    lots of N/As.
+
+    This version:
+      - accepts any numpy number via np.number
+      - parses compact strings like '10B' if they appear (fallback sources)
+    """
+    try:
+        v = d.get(key, None)
+        out = _to_float(v)
+        if out is None:
+            return None
+        if pd.isna(out):
+            return None
+        return float(out)
     except Exception:
         return None
+
+
+def _fmp_first_record(payload: Any) -> Optional[Dict[str, Any]]:
+    """FMP endpoints sometimes return list[dict]; sometimes dict."""
+    if payload is None:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, list) and payload:
+        if isinstance(payload[0], dict):
+            return payload[0]
+    return None
+
+
+def _fmp_get_num(bundle: Dict[str, Any], section: str, *keys: str) -> Optional[float]:
+    """
+    Extract a numeric value from an FMP bundle section.
+    Example: _fmp_get_num(fmp_data, "quote", "price") or ("marketCap").
+    """
+    rec = _fmp_first_record(bundle.get(section))
+    if not rec:
+        return None
+    for k in keys:
+        if k in rec:
+            v = _to_float(rec.get(k))
+            if v is not None:
+                return v
+    return None
 
 
 def get_row(df: pd.DataFrame, names: List[str]) -> Optional[pd.Series]:
@@ -234,9 +356,18 @@ def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
     'not meaningful' ratios are explicitly explained.
     """
     tkr = yf.Ticker(ticker)
-    info = tkr.get_info()
+    info = tkr.get_info() or {}
 
     notes: Dict[str, str] = {}
+
+    # --- Optional FMP fallback bundle (only if FMP_API_KEY is set) ---
+    fmp = FMPClient()
+    fmp_data: Dict[str, Any] = {}
+    if fmp.enabled:
+        fmp_data = fmp.fetch_all(ticker) or {}
+        notes["FMP"] = f"enabled=yes; requests={fmp.request_count}; last_status={fmp.last_status}; last_error={fmp.last_error}"
+    else:
+        notes["FMP"] = "enabled=no (set FMP_API_KEY env var to enable fallback)"
 
     sector = info.get("sector")
     industry = info.get("industry")
@@ -254,6 +385,10 @@ def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
     p3y = _adj_close(h3y)
 
     price = float(p5.iloc[-1]) if not p5.empty else safe_get(info, "currentPrice")
+    if price is None:
+        price = _fmp_get_num(fmp_data, "quote", "price")
+    if price is None:
+        price = safe_get(info, "regularMarketPrice")
 
     # --- NUPL legacy (Adj Close) ---
     twap10 = twap(p10)
@@ -270,6 +405,9 @@ def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
     nupl_vwap10 = (price - vwap10) / price if (price and vwap10) else None
 
     shares_out = safe_get(info, "sharesOutstanding")
+    if shares_out is None:
+        shares_out = _fmp_get_num(fmp_data, "profile", "sharesOutstanding")
+
     realized_series = turnover_realized_price(p10, h10["Volume"], shares_out) if (h10 is not None and not h10.empty and "Volume" in h10.columns) else pd.Series(dtype=float)
     realized_price = float(realized_series.iloc[-1]) if not realized_series.empty else None
     nupl_turnover = (price - realized_price) / price if (price and realized_price) else None
@@ -306,14 +444,24 @@ def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
     annual_bs = tkr.balance_sheet
     annual_cf = tkr.cashflow
 
-    # Valuation basics
+    # Valuation basics (Yahoo → FMP fallback)
     trailing_pe = safe_get(info, "trailingPE")
     ev_ebitda = safe_get(info, "enterpriseToEbitda")
+
     beta = safe_get(info, "beta")
+    if beta is None:
+        beta = _fmp_get_num(fmp_data, "profile", "beta")
+
     short_pct = safe_get(info, "shortPercentOfFloat")
     short_ratio = safe_get(info, "shortRatio")
+
     ev = safe_get(info, "enterpriseValue")
+    if ev is None:
+        ev = _fmp_get_num(fmp_data, "enterprise_value", "enterpriseValue")
+
     mcap = safe_get(info, "marketCap")
+    if mcap is None:
+        mcap = _fmp_get_num(fmp_data, "quote", "marketCap")
 
     # TTM revenue & FCF
     q_income = tkr.quarterly_income_stmt
@@ -327,11 +475,12 @@ def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
 
     # P/S
     ps = safe_get(info, "priceToSalesTrailing12Months")
+    if ps is None:
+        ps = _fmp_get_num(fmp_data, "ratios_ttm", "priceToSalesRatioTTM", "priceToSalesRatio")
     if ps is None and mcap is not None and ttm_rev not in (None, 0):
         ps = float(mcap) / float(ttm_rev)
 
-    # -------- EV/EBIT (PATCH) --------
-    # Use TTM Operating Income as the primary EBIT proxy to avoid "near-zero annual EBIT" blowups.
+    # -------- EV/EBIT (stability patch) --------
     ttm_ebit = last_n_quarters_sum(q_income, ["Operating Income", "OperatingIncome"], n=4)
 
     annual_ebit = None
@@ -353,11 +502,9 @@ def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
         notes["EV/EBIT"] = "No meaningful data to calculate this ratio (missing EV or EBIT proxy)."
         notes["Earnings Yield (EBIT / EV)"] = "No meaningful data to calculate this ratio (missing EV or EBIT proxy)."
     elif ebit_used <= 0:
-        # Negative EBIT -> not meaningful for EV/EBIT
         notes["EV/EBIT"] = "No meaningful data to calculate this ratio (EBIT <= 0)."
         notes["Earnings Yield (EBIT / EV)"] = "No meaningful data to calculate this ratio (EBIT <= 0)."
     else:
-        # Tiny EBIT guard (prevents EV/EBIT=3000+ when EBIT is basically ~0)
         if ttm_rev not in (None, 0) and (float(ebit_used) / float(ttm_rev)) < 0.005:
             notes["EV/EBIT"] = "No meaningful data to calculate this ratio (EBIT margin < 0.5% → ratio becomes unstable)."
             notes["Earnings Yield (EBIT / EV)"] = "No meaningful data to calculate this ratio (EBIT margin < 0.5% → inverse becomes unstable)."
@@ -375,6 +522,23 @@ def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
     op_m = safe_get(info, "operatingMargins")
     net_m = safe_get(info, "profitMargins")
     roe = safe_get(info, "returnOnEquity")
+
+    if gross_m is None:
+        gm = _fmp_get_num(fmp_data, "ratios_ttm", "grossProfitMarginTTM", "grossProfitMargin")
+        if gm is not None:
+            gross_m = gm if abs(gm) <= 1.5 else (gm / 100.0)
+    if op_m is None:
+        om = _fmp_get_num(fmp_data, "ratios_ttm", "operatingProfitMarginTTM", "operatingProfitMargin")
+        if om is not None:
+            op_m = om if abs(om) <= 1.5 else (om / 100.0)
+    if net_m is None:
+        nm = _fmp_get_num(fmp_data, "ratios_ttm", "netProfitMarginTTM", "netProfitMargin")
+        if nm is not None:
+            net_m = nm if abs(nm) <= 1.5 else (nm / 100.0)
+    if roe is None:
+        r = _fmp_get_num(fmp_data, "ratios_ttm", "returnOnEquityTTM", "returnOnEquity")
+        if r is not None:
+            roe = r if abs(r) <= 1.5 else (r / 100.0)
 
     gross_m_pct = gross_m * 100 if gross_m is not None else None
     op_m_pct = op_m * 100 if op_m is not None else None
@@ -416,10 +580,13 @@ def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
             net_debt = float(debt) - float(cash)
 
     ebitda = safe_get(info, "ebitda")
+    if ebitda is None:
+        ebitda = _fmp_get_num(fmp_data, "key_metrics_ttm", "ebitdaTTM", "ebitda")
+
     nd_ebitda = float(net_debt) / float(ebitda) if (net_debt is not None and ebitda not in (None, 0)) else None
     nd_fcf = float(net_debt) / float(ttm_fcf) if (net_debt is not None and ttm_fcf not in (None, 0)) else None
 
-    # Interest coverage (use EBIT proxy as well; if EBIT is unstable, this may be unstable too)
+    # Interest coverage
     interest_cov = None
     fcf_interest = None
     if annual_income is not None and not annual_income.empty:
@@ -459,6 +626,9 @@ def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
     rev_cagr = cagr(revs)
 
     shares = safe_get(info, "sharesOutstanding")
+    if shares is None:
+        shares = shares_out
+
     revps_cagr = None
     if shares and shares > 0 and len(revs) >= 2:
         revps = [r / shares if r is not None else None for r in revs]

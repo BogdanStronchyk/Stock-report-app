@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 
 
 class FMPClient:
-    \"\"\"Financial Modeling Prep fallback client.
+    """Financial Modeling Prep fallback client.
 
     IMPORTANT: FMP has *two* URL styles:
       - Legacy v3 style: /api/v3/<endpoint>/<SYMBOL>?period=quarter&limit=...&apikey=...
@@ -17,7 +17,7 @@ class FMPClient:
     This client primarily uses the v3 style for statements and enterprise values,
     because those endpoints are clearly documented with the symbol in the path.
     For TTM ratios/key-metrics, we try v3 first and then stable as a fallback.
-    \"\"\"
+    """
 
 
     def __init__(self, api_key: Optional[str] = None, timeout: int = 25):
@@ -110,7 +110,6 @@ class FMPClient:
     # Fetch bundle
     # -----------------------
     def fetch_all(self, symbol: str) -> Dict[str, Any]:
-        \"\"\"Fetch a small bundle of endpoints used for fallback fills.\"\"\"
         if not self.enabled:
             return {}
 
