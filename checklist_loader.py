@@ -3,40 +3,82 @@ import re
 from typing import Any, Dict, Optional, Tuple
 from openpyxl import load_workbook
 
-def parse_range_cell(s: Any) -> Optional[Tuple[Optional[float], Optional[float]]]:
-    if s is None or not isinstance(s, str):
-        return None
+_NUM = r"[+-]?\d*\.?\d+"  # signed float
 
-    txt = s.strip()
+
+def parse_range_cell(s: Any) -> Optional[Tuple[Optional[float], Optional[float]]]:
+    """
+    Robustly parse threshold text into (lo, hi).
+
+    Handles messy real-world checklist strings like:
+      "< 15"
+      "15–25"
+      "> 25 or negative"
+      "> 6% | otherwise ..."
+      "< 3 days"
+      "3–6 days"
+      "<= 10"
+      ">= -20%"
+      "$10B" / "$250M" / "$1.2T"
+      "-35 to -50"
+      "-10% to -20%"
+
+    Returns (None, hi) for "< hi", (lo, None) for "> lo", (lo, hi) for ranges.
+    """
+    if s is None:
+        return None
+    txt = str(s).strip()
     if not txt:
         return None
 
-    txt = txt.replace("–", "-").replace("×", "").replace("x", "").strip()
+    # Normalize dashes and whitespace
+    txt = txt.replace("–", "-").replace("—", "-")
+    txt = re.sub(r"\s+", " ", txt).strip()
 
-    if any(w in txt.lower() for w in ["expanding", "stable", "contracting", "not primary", "not used", "use"]):
+    # Ignore purely qualitative guidance (keep this list tight)
+    low_txt = txt.lower()
+    if any(w in low_txt for w in ["expanding", "stable", "contracting"]):
         return None
 
+    # Remove separators that interfere with float parsing
+    txt = txt.replace(",", "").replace("_", "")
+
+    # Currency multipliers (only if $ is present)
     mul = 1.0
     if "$" in txt:
-        if "b" in txt.lower():
-            mul = 1e9
-        elif "m" in txt.lower():
-            mul = 1e6
-        txt = txt.replace("$", "").replace("B", "").replace("b", "").replace("M", "").replace("m", "").strip()
+        # detect suffix after a number, e.g. $10B, $250M, $1.2T
+        m = re.search(rf"({_NUM})\s*([KMBT])\b", txt, flags=re.IGNORECASE)
+        if m:
+            suf = m.group(2).upper()
+            mul = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}.get(suf, 1.0)
+            # strip the suffix letter so the remaining patterns still match
+            txt = re.sub(rf"({_NUM})\s*[KMBT]\b", r"\1", txt, flags=re.IGNORECASE)
 
+        txt = txt.replace("$", "").strip()
+
+    # Remove % (your metrics are already in percent units, not fractions)
     txt = txt.replace("%", "").strip()
 
-    m = re.match(r"^<\s*([0-9\.]+)", txt)
-    if m:
-        return (None, float(m.group(1)) * mul)
+    # Normalize "to" to "-"
+    txt = re.sub(r"\s+to\s+", " - ", txt, flags=re.IGNORECASE)
 
-    m = re.match(r"^>\s*([0-9\.]+)", txt)
+    # 1) Comparator rule anywhere in the string (supports extra trailing words)
+    m = re.search(rf"(<=|>=|<|>)\s*({_NUM})", txt)
     if m:
-        return (float(m.group(1)) * mul, None)
+        op = m.group(1)
+        num = float(m.group(2)) * mul
+        if op in ("<", "<="):
+            return (None, num)
+        else:
+            return (num, None)
 
-    m = re.match(r"^([0-9\.]+)\s*-\s*([0-9\.]+)", txt)
+    # 2) Range rule anywhere in the string (supports extra trailing words like "days")
+    m = re.search(rf"({_NUM})\s*-\s*({_NUM})", txt)
     if m:
-        return (float(m.group(1)) * mul, float(m.group(2)) * mul)
+        a = float(m.group(1)) * mul
+        b = float(m.group(2)) * mul
+        lo, hi = (a, b) if a <= b else (b, a)
+        return (lo, hi)
 
     return None
 
@@ -75,6 +117,7 @@ def load_thresholds_from_excel(path: str) -> Dict[str, Dict[str, Dict[str, Any]]
                 }
             }
 
+    # Sector adjustments sheet (optional)
     if "Sector Adjustments" in wb.sheetnames:
         ws = wb["Sector Adjustments"]
         header = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
@@ -122,14 +165,21 @@ def load_thresholds_from_excel(path: str) -> Dict[str, Dict[str, Dict[str, Any]]
                             "yellow_txt": yellow_txt,
                             "red_txt": red_txt,
                             "marking": thresholds[cat][metric]["Default (All)"].get("marking"),
-                            "notes": sec_notes or thresholds[cat][metric]["Default (All)"].get("notes"),
+                            "notes": sec_notes,
                         }
 
     return thresholds
 
 
-def get_threshold_set(thresholds: Dict[str, Dict[str, Dict[str, Any]]], category: str, metric: str, sector_bucket: str):
-    entry = thresholds.get(category, {}).get(metric)
-    if not entry:
-        return None
-    return entry.get(sector_bucket) or entry.get("Default (All)")
+def get_threshold_set(
+    thresholds: Dict[str, Dict[str, Dict[str, Any]]],
+    category: str,
+    metric: str,
+    sector_bucket: str
+) -> Dict[str, Any]:
+    if category not in thresholds or metric not in thresholds[category]:
+        return {}
+    by_sector = thresholds[category][metric]
+    if sector_bucket in by_sector:
+        return by_sector[sector_bucket]
+    return by_sector.get("Default (All)", {})
