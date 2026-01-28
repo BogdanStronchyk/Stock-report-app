@@ -524,21 +524,56 @@ def _write_reversal_block(ws, start_row: int, title: str, symbols: Dict[str, str
 
 def _add_cheat_sheet(wb: Workbook):
     ws = wb.create_sheet("Cheat Sheet", 1)
-    ws["A1"] = "Adjusted score bands + flags"
-    ws.merge_cells("A1:F1")
-    ws["A2"] = "Band colors (Adjusted scores)"
-    ws["A3"] = ">=60 GREEN (strong) | 40–60 YELLOW (ok/fragile) | <40 RED (weak/unknown) | NA GRAY"
-    ws["A5"] = "Flags (pattern decisioning)"
-    ws["A6"] = "🚩 Cheap but no reversal: valuation supportive but confirmation absent (watchlist / patience)"
-    ws["A7"] = "🚩 Reversal but expensive: confirmation strong but valuation demanding (quality momentum / wait for entry)"
-    ws["A8"] = "⚠ flags are not errors; they highlight mismatches to categorize setups."
-    ws["A10"] = "Position guidance (supportive heuristic)"
-    ws["A11"] = "OK: default sizing; CAUTION: smaller/starter; AVOID: 0%."
-    ws["A12"] = "0.5–1% starter | 1–3% core | 3–5% high conviction (rare)."
 
-    for r in range(1, 13):
+    ws["A1"] = "HOW TO READ THIS REPORT — CHEAT SHEET"
+    ws.merge_cells("A1:F1")
+
+    ws["A3"] = "Adjusted score bands (Checklist + Risk-adjusted)"
+    ws["A4"] = "GREEN ≥ 60  → strong / supportive"
+    ws["A5"] = "YELLOW 40–59 → acceptable but fragile"
+    ws["A6"] = "RED < 40     → weak or structurally risky"
+    ws["A7"] = "GRAY (NA)    → insufficient or unreliable data"
+
+    ws["A9"] = "Flags (pattern decisioning — NOT errors)"
+    ws["A10"] = "🚩 Cheap but no reversal"
+    ws["A11"] = "  Valuation looks supportive, but technical / reversal confirmation is missing."
+    ws["A12"] = "  Typical action: WATCHLIST, wait for confirmation."
+    ws["A13"] = "🚩 Reversal but expensive"
+    ws["A14"] = "  Momentum and confirmation are strong, but valuation is stretched."
+    ws["A15"] = "  Typical action: quality momentum; wait for pullback."
+    ws["A16"] = "⚠ Strong fundamentals, weak confirmation"
+    ws["A17"] = "  Business quality improving, but price action not aligned yet."
+    ws["A18"] = "⚠ Strong confirmation, weak fundamentals"
+    ws["A19"] = "  Price action improving ahead of fundamentals — higher risk timing trade."
+    ws["A20"] = "🚩 Reversal but no downside protection"
+    ws["A21"] = "  Trend improving, but DAVF shows no conservative downside buffer."
+    ws["A22"] = "🚩 Below conservative value, but no reversal yet"
+    ws["A23"] = "  Priced below conservative value floor; waiting for confirmation."
+    ws["A24"] = "🚩 Extreme DAVF — base stability review required"
+    ws["A25"] = "  Extremely large margin-of-safety driven by unstable or cyclical base."
+
+    ws["A27"] = "Position guidance (decision support, not advice)"
+    ws["A28"] = "OK      → default sizing allowed"
+    ws["A29"] = "CAUTION → starter / reduced sizing"
+    ws["A30"] = "AVOID   → 0% allocation"
+    ws["A31"] = "Typical sizing: 0.5–1% starter | 1–3% core | 3–5% high conviction (rare)"
+
+    ws["A33"] = "Final Recommendation Banner — meaning"
+    ws["A34"] = "✅ ACCUMULATE"
+    ws["A35"] = "  Downside protected (DAVF GREEN) + reversal confirmation present."
+    ws["A36"] = "⚠ STARTER"
+    ws["A37"] = "  Partial downside buffer or early confirmation — small initial position."
+    ws["A38"] = "⚠ WATCH"
+    ws["A39"] = "  Value or quality present, but timing incomplete."
+    ws["A40"] = "🟡 HOLD"
+    ws["A41"] = "  Quality business, but price lacks downside protection."
+    ws["A42"] = "❌ AVOID"
+    ws["A43"] = "  No downside protection and/or weak fundamentals."
+
+    for r in range(1, 45):
         ws[f"A{r}"].alignment = ALIGN_WRAP
-    ws.column_dimensions["A"].width = 95
+
+    ws.column_dimensions["A"].width = 105
 
 
 def create_report_workbook(
