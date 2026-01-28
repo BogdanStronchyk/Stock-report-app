@@ -17,6 +17,8 @@ from scoring import (
     compute_category_score_and_coverage,
     adjusted_from_raw_and_coverage,
 )
+from eligibility import evaluate_eligibility
+
 
 # =========================
 # Display helpers
@@ -646,6 +648,11 @@ def create_report_workbook(
         "Risk Label",
         "DAVF Downside Protection",
         "Recommendation",
+        "Eligibility",
+        "Eligibility Notes",
+        "Overall Coverage %",
+        "Valuation Coverage %",
+        "Balance Sheet Coverage %",
     ])
     for cell in ws_sum[1]:
         cell.fill = FILL_HDR
@@ -680,7 +687,8 @@ def create_report_workbook(
         category_ratings: Dict[str, Dict[str, str]] = {c: {} for c in category_maps}
         category_weights: Dict[str, Dict[str, float]] = {c: {} for c in category_maps}
 
-        row = 12
+        # Leave space for score + eligibility blocks before the category tables.
+        row = 15
 
         for cat_sheet, cat_title in category_maps.items():
             ws.cell(row, 1).value = cat_title
@@ -749,17 +757,36 @@ def create_report_workbook(
 
         # Adjusted category scores and overall adjusted checklist score
         cat_adj: Dict[str, Optional[float]] = {}
+        cat_cov: Dict[str, float] = {}
         for cat in category_maps.values():
             raw, cov = compute_category_score_and_coverage(category_ratings[cat], category_weights[cat])
             raw = _apply_category_caps(cat, raw, category_ratings[cat])
+            cat_cov[cat] = float(cov or 0.0)
             cat_adj[cat] = adjusted_from_raw_and_coverage(raw, cov)
 
         fund_checklist_adj = _weighted_blend(cat_adj)
         davf_label = m.get("DAVF Downside Protection") or "NA"
+        # Eligibility gating (fail-closed) for index-scale screening.
+        # This does NOT add new metrics; it enforces minimum scorable coverage and sector anchors.
+        elig = evaluate_eligibility(
+            mode="shortlist",
+            cat_adj=cat_adj,
+            cat_cov=cat_cov,
+            category_ratings=category_ratings,
+            sector_bucket=bucket,
+            fund_adj=fund_checklist_adj,
+            reversal_total=revpack.get("total_score_pct"),
+            davf_label=davf_label,
+        )
         davf_mos = m.get("DAVF MOS vs Floor (%)")
         davf_conf = m.get("DAVF Confidence") or "NA"
         flags = conflict_flags(cat_adj.get("Valuation"), revpack.get("total_score_pct"), fund_checklist_adj,
                                davf_label=davf_label, davf_mos=davf_mos, davf_conf=davf_conf)
+        # Append eligibility signals into Flags for fast triage.
+        if elig.status == "FAIL":
+            flags = (flags + " | " if flags else "") + "⛔ Ineligible (coverage/sector gates)"
+        elif elig.status == "WATCH":
+            flags = (flags + " | " if flags else "") + "⚠ Eligibility watch (coverage/DAVF)"
         pos_size, risk_label = position_guidance(
 
             fund_adj=fund_checklist_adj,
@@ -778,6 +805,12 @@ def create_report_workbook(
             risk_label=risk_label,
         )
 
+        # Eligibility overrides: never show an ACCUMULATE/STARTER-style banner if the ticker is not eligible.
+        if elig.status == "FAIL":
+            rec_text, rec_fill = (f"⛔ INELIGIBLE — {elig.reasons_text(2)}", FILL_GRAY)
+        elif elig.status == "WATCH":
+            rec_text, rec_fill = (f"⚠ WATCH — {elig.reasons_text(2)}", FILL_YELLOW)
+
         # Ticker headline (adjusted-only) + color bands
         # Ticker headline (adjusted-only) + color bands
         ws["D2"] = "Valuation % (Adj)"; ws["E2"] = cat_adj["Valuation"]
@@ -790,6 +823,9 @@ def create_report_workbook(
         ws["D9"] = "Flags"; ws["E9"] = flags
         ws["D10"] = "Position / Label"; ws["E10"] = f"{pos_size} | {risk_label}"
         ws["D11"] = "Recommendation"; ws["E11"] = rec_text
+        ws["D12"] = "Eligibility"; ws["E12"] = elig.label
+        ws["D13"] = "Eligibility Notes"; ws["E13"] = elig.reasons_text(3)
+        ws["D14"] = "Data Coverage % (Overall)"; ws["E14"] = elig.overall_coverage_pct
 
         for r in range(2, 8):
             ws[f"D{r}"].font = FONT_HDR
@@ -829,6 +865,25 @@ def create_report_workbook(
         ws["E11"].font = FONT_HDR
         ws["E11"].alignment = ALIGN_WRAP
 
+        # Eligibility rows (in score table)
+        for rr in (12, 13, 14):
+            ws[f"D{rr}"].font = FONT_HDR
+            ws[f"D{rr}"].fill = FILL_HDR
+            ws[f"D{rr}"].alignment = ALIGN_CENTER
+            ws[f"E{rr}"].alignment = ALIGN_WRAP
+
+        # Eligibility cell fill
+        if elig.status == "PASS":
+            ws["E12"].fill = FILL_GREEN
+        elif elig.status == "WATCH":
+            ws["E12"].fill = FILL_YELLOW
+        else:
+            ws["E12"].fill = FILL_GRAY
+
+        ws["E12"].font = FONT_HDR
+        ws["E14"].fill = band_fill(ws["E14"].value)
+        ws["E14"].alignment = ALIGN_CENTER
+
         # Summary row
         ws_sum.append([
             t,
@@ -853,6 +908,11 @@ def create_report_workbook(
             risk_label,
             davf_label,
             rec_text,
+            elig.label,
+            elig.reasons_text(3),
+            elig.overall_coverage_pct,
+            cat_cov.get("Valuation", 0.0),
+            cat_cov.get("Balance Sheet", 0.0),
         ])
 
         
@@ -892,6 +952,23 @@ def create_report_workbook(
 
         # Recommendation column = 22
         ws_sum.cell(sr, 22).alignment = ALIGN_WRAP
+
+        # Eligibility column = 23
+        if elig.status == "PASS":
+            ws_sum.cell(sr, 23).fill = FILL_GREEN
+        elif elig.status == "WATCH":
+            ws_sum.cell(sr, 23).fill = FILL_YELLOW
+        else:
+            ws_sum.cell(sr, 23).fill = FILL_GRAY
+        ws_sum.cell(sr, 23).alignment = ALIGN_CENTER
+
+        # Eligibility Notes column = 24
+        ws_sum.cell(sr, 24).alignment = ALIGN_WRAP
+
+        # Coverage columns = 25..27 (Overall, Valuation, Balance Sheet)
+        for c in (25, 26, 27):
+            ws_sum.cell(sr, c).fill = band_fill(ws_sum.cell(sr, c).value)
+            ws_sum.cell(sr, c).alignment = ALIGN_CENTER
 
         # Reversal blocks
         row = _write_reversal_block(
