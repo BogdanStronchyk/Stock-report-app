@@ -498,6 +498,11 @@ def create_report_workbook(
         ws["A3"] = "Yahoo Industry"; ws["B3"] = m.get("Yahoo Industry")
         ws["A4"] = "Price"; ws["B4"] = m.get("Price")
         ws["A5"] = "Data Notes"; ws["B5"] = (metric_notes.get("FMP") or "")[:4000]
+        # DAVF header block (always visible even if not in checklist template)
+        ws["A6"] = "DAVF Value Floor (per share)"; ws["B6"] = m.get("DAVF Value Floor (per share)")
+        ws["A7"] = "DAVF MOS vs Floor (%)"; ws["B7"] = m.get("DAVF MOS vs Floor (%)")
+        ws["A8"] = "DAVF Confidence"; ws["B8"] = m.get("DAVF Confidence")
+        ws["A9"] = "DAVF Notes"; ws["B9"] = (metric_notes.get("DAVF") or "")[:4000]
 
         category_ratings: Dict[str, Dict[str, str]] = {c: {} for c in category_maps}
         category_weights: Dict[str, Dict[str, float]] = {c: {} for c in category_maps}

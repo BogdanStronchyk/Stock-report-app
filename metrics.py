@@ -21,6 +21,225 @@ _MULTIPLIERS = {
     "T": 1e12,
 }
 
+# -------------------------------------------------------------------
+# DAVF (Downside-Anchored Value Floor)
+# -------------------------------------------------------------------
+# Conservative value floor (not a fair-value model):
+#   - uses normalized historical cashflows/earnings (no forecasts)
+#   - applies only downside haircuts (durability / fragility proxies)
+#   - subtracts net debt (or adds net cash) to get an equity floor
+# Output:
+#   DAVF Value Floor (per share), DAVF MOS % (vs floor), confidence + diagnostics
+
+SECTOR_FLOOR_MULTIPLES = {
+    # keep these conservative and stable; tune later if needed
+    "Defensive": 10.0,
+    "Cyclical": 6.0,
+    "Capital Intensive": 5.0,
+    "Asset Heavy": 0.8,     # intended for P/B style fallback; we won't use unless needed
+    "High Growth": 8.0,
+    "Default (All)": 7.0,
+}
+
+def _winsorize(vals, p_lo=0.10, p_hi=0.90):
+    xs = [float(v) for v in vals if v is not None and not (isinstance(v, float) and (math.isnan(v) or math.isinf(v)))]
+    if len(xs) < 3:
+        return xs
+    lo = float(np.quantile(xs, p_lo))
+    hi = float(np.quantile(xs, p_hi))
+    return [min(max(x, lo), hi) for x in xs]
+
+def _median_pos(vals):
+    xs = [float(v) for v in vals if v is not None and float(v) > 0 and not (isinstance(v, float) and (math.isnan(v) or math.isinf(v)))]
+    if not xs:
+        return None
+    return float(np.median(xs))
+
+def _fcf_series_annual(annual_cf: pd.DataFrame, n: int = 8):
+    """Oldest->newest annual FCF series using OCF + CapEx (CapEx is usually negative)."""
+    if annual_cf is None or annual_cf.empty:
+        return []
+    ocf_s = annual_series(annual_cf, ["Operating Cash Flow", "Total Cash From Operating Activities"], n)
+    cap_s = annual_series(annual_cf, ["Capital Expenditure", "CapitalExpenditure"], n)
+    if not ocf_s or not cap_s:
+        return []
+    out = []
+    for o, c in zip(ocf_s, cap_s):
+        out.append((o + c) if (o is not None and c is not None) else None)
+    return out
+
+def _ebit_series_annual(annual_income: pd.DataFrame, n: int = 8):
+    if annual_income is None or annual_income.empty:
+        return []
+    return annual_series(annual_income, ["EBIT", "Ebit", "Operating Income", "OperatingIncome"], n)
+
+def _ni_series_annual(annual_income: pd.DataFrame, n: int = 8):
+    if annual_income is None or annual_income.empty:
+        return []
+    return annual_series(annual_income, ["Net Income", "NetIncome"], n)
+
+def _interest_series_annual(annual_income: pd.DataFrame, n: int = 8):
+    if annual_income is None or annual_income.empty:
+        return []
+    return annual_series(annual_income, ["Interest Expense", "InterestExpense"], n)
+
+def _net_debt_latest(annual_bs: pd.DataFrame) -> Optional[float]:
+    if annual_bs is None or annual_bs.empty:
+        return None
+
+    cash = None
+    debt = None
+    for k in ["Cash And Cash Equivalents", "CashAndCashEquivalents"]:
+        if k in annual_bs.index:
+            cash = _to_float(annual_bs.loc[k].iloc[0])
+            break
+    for k in ["Total Debt", "TotalDebt", "Long Term Debt", "LongTermDebt"]:
+        if k in annual_bs.index:
+            debt = _to_float(annual_bs.loc[k].iloc[0])
+            break
+
+    if cash is None or debt is None:
+        return None
+    return float(debt) - float(cash)
+
+def compute_davf(
+    sector_bucket: str,
+    price: Optional[float],
+    shares_out: Optional[float],
+    annual_income: pd.DataFrame,
+    annual_cf: pd.DataFrame,
+    annual_bs: pd.DataFrame,
+    roic_pct: Optional[float],
+    nd_ebitda: Optional[float],
+    interest_cov: Optional[float],
+) -> Dict[str, Any]:
+    """
+    Returns a dict with:
+      - davf_floor_ps
+      - davf_mos_pct
+      - davf_confidence
+      - davf_base_type
+      - davf_multiple
+      - davf_haircut_pct
+      - davf_note
+    """
+    out: Dict[str, Any] = {
+        "davf_floor_ps": None,
+        "davf_mos_pct": None,
+        "davf_confidence": "NA",
+        "davf_base_type": None,
+        "davf_multiple": None,
+        "davf_haircut_pct": None,
+        "davf_note": "",
+    }
+
+    if price in (None, 0) or shares_out in (None, 0):
+        out["davf_note"] = "Missing price or sharesOutstanding."
+        return out
+
+    mult = float(SECTOR_FLOOR_MULTIPLES.get(sector_bucket, SECTOR_FLOOR_MULTIPLES["Default (All)"]))
+    out["davf_multiple"] = mult
+
+    # --- Choose normalized base: FCF (preferred) → EBIT → Net Income ---
+    fcf_series = _fcf_series_annual(annual_cf, n=8)
+    ebit_series = _ebit_series_annual(annual_income, n=8)
+    ni_series = _ni_series_annual(annual_income, n=8)
+
+    # Use winsorized, positive medians
+    fcf_norm = _median_pos(_winsorize(fcf_series))
+    ebit_norm = _median_pos(_winsorize(ebit_series))
+    ni_norm = _median_pos(_winsorize(ni_series))
+
+    base = None
+    base_type = None
+    years_used = 0
+
+    if fcf_norm is not None:
+        base = fcf_norm
+        base_type = "FCF (median, winsorized)"
+        years_used = len([v for v in fcf_series if v is not None])
+    elif ebit_norm is not None:
+        base = ebit_norm
+        base_type = "EBIT (median, winsorized)"
+        years_used = len([v for v in ebit_series if v is not None])
+    elif ni_norm is not None:
+        base = ni_norm
+        base_type = "Net Income (median, winsorized)"
+        years_used = len([v for v in ni_series if v is not None])
+    else:
+        out["davf_note"] = "No usable positive history for FCF/EBIT/Net Income."
+        return out
+
+    out["davf_base_type"] = base_type
+
+    # Confidence from coverage depth
+    if years_used >= 5:
+        out["davf_confidence"] = "HIGH"
+    elif years_used >= 3:
+        out["davf_confidence"] = "MEDIUM"
+    else:
+        out["davf_confidence"] = "LOW"
+
+    # --- Haircuts (durability / fragility proxies) ---
+    haircut = 0.0
+    hc_reasons = []
+
+    # Leverage proxy
+    if nd_ebitda is not None and nd_ebitda > 3:
+        haircut += 0.20
+        hc_reasons.append("Net Debt/EBITDA > 3")
+
+    # Coverage proxy
+    if interest_cov is not None and interest_cov < 3:
+        haircut += 0.20
+        hc_reasons.append("Interest coverage < 3")
+
+    # FCF volatility proxy (only if we used FCF and have enough years)
+    if base_type.startswith("FCF") and len([v for v in fcf_series if v is not None]) >= 4:
+        xs = [float(v) for v in fcf_series if v is not None]
+        xs = _winsorize(xs)
+        if len(xs) >= 4:
+            mu = float(np.mean(xs))
+            sig = float(np.std(xs))
+            if mu != 0 and abs(sig / mu) > 0.75:
+                haircut += 0.15
+                hc_reasons.append("FCF volatility high")
+
+    # ROIC proxy (if available)
+    if roic_pct is not None and roic_pct < 6:
+        haircut += 0.15
+        hc_reasons.append("ROIC weak (<6%)")
+
+    haircut = min(haircut, 0.50)  # cap at 50%
+    out["davf_haircut_pct"] = haircut * 100.0
+
+    # --- Equity floor calculation ---
+    # Enterprise-like floor from base × multiple, then subtract net debt (add net cash if negative net debt).
+    raw_value = float(base) * mult
+
+    nd = _net_debt_latest(annual_bs)
+    if nd is not None:
+        raw_value = raw_value - float(nd)
+
+    adj_value = raw_value * (1.0 - haircut)
+
+    # Per share floor
+    floor_ps = adj_value / float(shares_out)
+    out["davf_floor_ps"] = float(floor_ps)
+
+    mos = (float(floor_ps) / float(price) - 1.0) * 100.0
+    out["davf_mos_pct"] = float(mos)
+
+    # Note
+    note_bits = [f"Base={base_type}", f"Mult={mult:.1f}"]
+    if nd is not None:
+        note_bits.append(f"NetDebtAdj={'yes' if nd > 0 else 'net cash'}")
+    if haircut > 0:
+        note_bits.append(f"Haircut={haircut*100:.0f}% ({', '.join(hc_reasons)})")
+    out["davf_note"] = " | ".join(note_bits)
+
+    return out
+
 
 def _to_float(value: Any) -> Optional[float]:
     """
@@ -665,6 +884,24 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
 
     worst_week_3y = worst_weekly_return_3y(h3y)
 
+    # --- DAVF (Downside-Anchored Value Floor) ---
+    davf = compute_davf(
+        sector_bucket=sector_bucket,
+        price=price,
+        shares_out=shares_out,
+        annual_income=annual_income,
+        annual_cf=annual_cf,
+        annual_bs=annual_bs,
+        roic_pct=roic_pct,
+        nd_ebitda=nd_ebitda,
+        interest_cov=interest_cov,
+    )
+
+    # Add to notes so it shows up in report (Notes column + header block)
+    if davf.get("davf_note"):
+        notes["DAVF"] = davf["davf_note"]
+
+
     return {
         "__notes__": notes,
 
@@ -735,4 +972,13 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
         "Composite NUPL": composite_nupl,
         "Composite NUPL Z": composite_z,
         "NUPL Regime": nupl_regime,
+
+        # DAVF (Downside-Anchored Value Floor)
+        "DAVF Value Floor (per share)": davf.get("davf_floor_ps"),
+        "DAVF MOS vs Floor (%)": davf.get("davf_mos_pct"),
+        "DAVF Confidence": davf.get("davf_confidence"),
+        "DAVF Base Type": davf.get("davf_base_type"),
+        "DAVF Multiple Used": davf.get("davf_multiple"),
+        "DAVF Haircut (%)": davf.get("davf_haircut_pct"),
+
     }
