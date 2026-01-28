@@ -1,5 +1,7 @@
 import os
 import tkinter as tk
+
+from config import FORCE_FMP_FALLBACK
 from tkinter import messagebox
 from typing import Optional, Tuple
 
@@ -12,8 +14,10 @@ def ask_stocks(default_text: str = "") -> Optional[Tuple[str, bool]]:
     """
     result = {"value": None, "use_fmp": True}
 
-    # Default: enable FMP only if an API key is present
+    # Default: enable FMP only if an API key is present.
+    # If FORCE_FMP_FALLBACK=True, the checkbox is locked ON when a key exists.
     has_fmp_key = bool(os.environ.get("FMP_API_KEY", "").strip())
+    forced = bool(FORCE_FMP_FALLBACK) and has_fmp_key
     result["use_fmp"] = has_fmp_key
 
     root = tk.Tk()
@@ -60,11 +64,18 @@ def ask_stocks(default_text: str = "") -> Optional[Tuple[str, bool]]:
 
     # FMP toggle (optional fallback provider)
     use_fmp_var = tk.BooleanVar(value=result["use_fmp"])
+    label = "Use FMP fallback (requires FMP_API_KEY)"
+    if forced:
+        label = "Use FMP fallback (FORCED ON — FMP_API_KEY detected)"
+
     chk = tk.Checkbutton(
         root,
-        text="Use FMP fallback (requires FMP_API_KEY)",
+        text=label,
         variable=use_fmp_var
     )
+    if forced:
+        chk.configure(state="disabled")
+        use_fmp_var.set(True)
     chk.pack(pady=(6, 0))
 
     btn_frame = tk.Frame(root)

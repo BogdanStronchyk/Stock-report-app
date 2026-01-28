@@ -1,6 +1,9 @@
 from openpyxl.styles import PatternFill, Font, Alignment
 
-CHECKLIST_FILE = "Fundamental_Checklist_v2_with_sector_adjustments.xlsx"
+CHECKLIST_FILE = "Fundamental_Checklist_v3_value_matrix.xlsx"
+
+# If True and FMP_API_KEY is set, FMP will be used even if the UI toggle is off.
+FORCE_FMP_FALLBACK = True
 
 FILL_GREEN  = PatternFill("solid", fgColor="C6EFCE")
 FILL_YELLOW = PatternFill("solid", fgColor="FFEB9C")

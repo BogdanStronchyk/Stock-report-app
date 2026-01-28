@@ -5,6 +5,52 @@ from openpyxl import load_workbook
 
 _NUM = r"[+-]?\d*\.?\d+"  # signed float
 
+def _norm_metric(s: str) -> str:
+    s = s or ""
+    s = s.strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _strip_parens(s: str) -> str:
+    # remove parenthetical fragments to improve matching: "FCF Yield (TTM ...)" -> "FCF Yield"
+    return re.sub(r"\s*\([^)]*\)", "", s).strip()
+
+def _is_heading_row(metric: str) -> bool:
+    m = _norm_metric(metric)
+    if not m:
+        return True
+    # common non-metric helper rows in the Sector Adjustments sheet
+    return any(
+        x in m
+        for x in [
+            "how to use",
+            "step",
+            "sector id",
+            "adjustments",
+        ]
+    )
+
+def _metric_matches(adj_metric: str, threshold_metric: str) -> bool:
+    a = _norm_metric(adj_metric)
+    t = _norm_metric(threshold_metric)
+    if not a or not t:
+        return False
+    if a == t:
+        return True
+    # try without parentheses on either side
+    a2 = _norm_metric(_strip_parens(adj_metric))
+    t2 = _norm_metric(_strip_parens(threshold_metric))
+    if a2 and (a2 == t2):
+        return True
+    # containment / prefix matching (handles "FCF Yield" vs "FCF Yield (TTM ...)")
+    if a2 and a2 in t:
+        return True
+    if a and a in t:
+        return True
+    if t2 and t2 in a:
+        return True
+    return False
+
 
 def parse_range_cell(s: Any) -> Optional[Tuple[Optional[float], Optional[float]]]:
     """
@@ -143,6 +189,8 @@ def load_thresholds_from_excel(path: str) -> Dict[str, Dict[str, Dict[str, Any]]
             if not metric or not isinstance(metric, str):
                 continue
             metric = metric.strip()
+            if _is_heading_row(metric):
+                continue
 
             for sec in sector_cols:
                 if sec not in col_map:
@@ -159,12 +207,14 @@ def load_thresholds_from_excel(path: str) -> Dict[str, Dict[str, Dict[str, Any]]
                 sec_notes = ws.cell(r, notes_col).value
 
                 for cat in thresholds:
-                    if metric in thresholds[cat]:
-                        thresholds[cat][metric][sec] = {
+                    for tm in list(thresholds[cat].keys()):
+                        if _metric_matches(metric, tm):
+                            thresholds[cat][tm][sec] = {
+
                             "green_txt": green_txt,
                             "yellow_txt": yellow_txt,
                             "red_txt": red_txt,
-                            "marking": thresholds[cat][metric]["Default (All)"].get("marking"),
+                            "marking": thresholds[cat][tm]["Default (All)"].get("marking"),
                             "notes": sec_notes,
                         }
 

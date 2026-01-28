@@ -6,6 +6,7 @@ from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
 from config import (
+    CHECKLIST_FILE,
     FILL_HDR, FONT_HDR, ALIGN_CENTER, ALIGN_WRAP,
     FILL_GREEN, FILL_YELLOW, FILL_RED, FILL_GRAY
 )
@@ -443,6 +444,11 @@ def _metric_weight(category: str, metric: str) -> float:
             w = 1.3
         elif "Avg Daily $ Volume" in m:
             w = 1.2
+
+        elif "SBC % of Market Cap" in m or "SBC % of FCF" in m:
+            w = 1.3
+        elif "Share Count CAGR" in m or "Net Buyback Yield" in m or "Shareholder Yield" in m:
+            w = 1.2
         elif "Beta" in m:
             w = 1.0
         elif "Short Interest" in m or "Days to Cover" in m:
@@ -472,14 +478,18 @@ def _apply_category_caps(category: str, raw_score: Optional[float], ratings_by_m
 
 
 def _weighted_blend(values_by_category: Dict[str, Optional[float]]) -> Optional[float]:
+    """Weighted blend across categories.
+
+    IMPORTANT: Missing categories are treated as 0 (penalty), not ignored.
+    This prevents a report from looking artificially strong when data is missing.
+    """
     wsum = 0.0
     acc = 0.0
     for cat, w in CATEGORY_WEIGHTS.items():
-        v = values_by_category.get(cat)
-        if v is None:
-            continue
         wsum += float(w)
-        acc += float(w) * float(v)
+        v = values_by_category.get(cat)
+        v2 = 0.0 if v is None else float(v)
+        acc += float(w) * v2
     return None if wsum == 0 else (acc / wsum)
 
 
@@ -570,7 +580,15 @@ def _add_cheat_sheet(wb: Workbook):
     ws["A42"] = "❌ AVOID"
     ws["A43"] = "  No downside protection and/or weak fundamentals."
 
-    for r in range(1, 45):
+
+    ws["A45"] = "New / fixed metrics in this version"
+    ws["A46"] = "Shareholder Yield = Dividend Yield + Net Buyback Yield (3Y avg). Higher is better."
+    ws["A47"] = "Margin Trend (3–5Y) = change in operating margin (percentage points). Higher is better."
+    ws["A48"] = "EV/FCF (Normalized 5Y Median) and FCF Yield (Normalized) reduce one-off distortions in FCF."
+    ws["A49"] = "Share Count CAGR (3Y) and SBC burden show dilution pressure (lower is better)."
+    ws["A50"] = "If Risk metrics are all NA, the app likely failed to fetch price history (rate limit / connectivity)."
+
+    for r in range(1, 51):
         ws[f"A{r}"].alignment = ALIGN_WRAP
 
     ws.column_dimensions["A"].width = 105
@@ -620,7 +638,7 @@ def create_report_workbook(
 
         ws = wb.create_sheet(t)
 
-        ws["A1"] = f"{t} — Checklist v2 (Sector-adjusted): {bucket}"
+        ws["A1"] = f"{t} — Checklist ({CHECKLIST_FILE}) — Sector-adjusted: {bucket}"
         ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=6)
 
         ws["A2"] = "Yahoo Sector"; ws["B2"] = m.get("Yahoo Sector")
@@ -707,9 +725,12 @@ def create_report_workbook(
         for cat in category_maps.values():
             raw, cov = compute_category_score_and_coverage(category_ratings[cat], category_weights[cat])
             raw = _apply_category_caps(cat, raw, category_ratings[cat])
-            cat_adj[cat] = adjusted_from_raw_and_coverage(raw, cov)
+            adj = adjusted_from_raw_and_coverage(raw, cov)
+            cat_adj[cat] = 0.0 if adj is None else adj
 
         fund_checklist_adj = _weighted_blend(cat_adj)
+        if fund_checklist_adj is None:
+            fund_checklist_adj = 0.0
         davf_label = m.get("DAVF Downside Protection") or "NA"
         davf_mos = m.get("DAVF MOS vs Floor (%)")
         davf_conf = m.get("DAVF Confidence") or "NA"

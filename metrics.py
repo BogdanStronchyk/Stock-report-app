@@ -1,11 +1,15 @@
 import math
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+from config import FORCE_FMP_FALLBACK
+from value_matrix_extras import compute_value_matrix_extras
 
 from sector_map import map_sector
 from fmp_provider import FMPClient
@@ -414,6 +418,56 @@ def _adj_close(hist: pd.DataFrame) -> pd.Series:
     return hist["Close"].astype(float)
 
 
+
+def _fast_info_dict(tkr: yf.Ticker) -> Dict[str, Any]:
+    """Best-effort fast_info dict extraction (yfinance versions vary)."""
+    try:
+        fi = getattr(tkr, "fast_info", None)
+        if fi is None:
+            return {}
+        if isinstance(fi, dict):
+            return fi
+        return dict(fi)
+    except Exception:
+        return {}
+
+
+def _download_history(symbol: str, period: str, interval: str = "1d") -> pd.DataFrame:
+    """Fallback history fetch using yf.download (sometimes more stable than Ticker.history)."""
+    try:
+        return yf.download(
+            symbol,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+def _history_retry(symbol: str, tkr: yf.Ticker, period: str, interval: str = "1d", tries: int = 3) -> pd.DataFrame:
+    """Fetch history with small retries + yf.download fallback."""
+    last_err = None
+    for i in range(max(1, tries)):
+        try:
+            h = tkr.history(period=period, interval=interval, auto_adjust=False)
+            if h is not None and not h.empty:
+                return h
+        except Exception as e:
+            last_err = e
+        # small backoff (kept short to avoid UI feeling frozen)
+        try:
+            time.sleep(0.8 * (i + 1))
+        except Exception:
+            pass
+
+    h2 = _download_history(symbol, period, interval)
+    if h2 is not None and not h2.empty:
+        return h2
+    return pd.DataFrame()
+
 def twap(prices: pd.Series) -> Optional[float]:
     if prices is None or prices.empty:
         return None
@@ -606,18 +660,28 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
     """
     tkr = yf.Ticker(ticker)
     info = tkr.get_info() or {}
+    fast_info = _fast_info_dict(tkr)
 
     notes: Dict[str, str] = {}
 
-    # --- Optional FMP fallback bundle (toggleable) ---
-    # FMP is a fallback provider. Even if FMP_API_KEY is set, you can disable it via UI / caller.
+    # --- Optional FMP fallback bundle ---
+    # FMP is a *fallback* provider for missing/misaligned Yahoo fields (shares, EV, margins, etc).
+    # If FORCE_FMP_FALLBACK=True and FMP_API_KEY is present, we use it even if the UI toggle is off.
     fmp_data: Dict[str, Any] = {}
     fmp = FMPClient()
-    if not use_fmp_fallback:
+
+    requested = bool(use_fmp_fallback)
+    forced = bool(FORCE_FMP_FALLBACK)
+    use_fmp_effective = requested or forced
+
+    if not use_fmp_effective:
         notes["FMP"] = "enabled=no (disabled by user)"
     elif fmp.enabled:
         fmp_data = fmp.fetch_all(ticker) or {}
-        notes["FMP"] = f"enabled=yes; requests={fmp.request_count}; last_status={fmp.last_status}; last_error={fmp.last_error}"
+        if forced and not requested:
+            notes["FMP"] = f"enabled=yes (FORCED); requests={fmp.request_count}; last_status={fmp.last_status}; last_error={fmp.last_error}"
+        else:
+            notes["FMP"] = f"enabled=yes; requests={fmp.request_count}; last_status={fmp.last_status}; last_error={fmp.last_error}"
     else:
         notes["FMP"] = "enabled=no (set FMP_API_KEY env var to enable fallback)"
 
@@ -626,21 +690,51 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
     sector_bucket = map_sector(sector, industry)
 
     # Price histories (keep Adj Close column)
-    h10 = tkr.history(period="10y", interval="1d", auto_adjust=False)
-    h5 = tkr.history(period="5y", interval="1d", auto_adjust=False)
-    h1y = tkr.history(period="1y", interval="1d", auto_adjust=False)
-    h3y = tkr.history(period="3y", interval="1d", auto_adjust=False)
+    h10 = _history_retry(ticker, tkr, period="10y", interval="1d")
+    h5 = _history_retry(ticker, tkr, period="5y", interval="1d")
+    h1y = _history_retry(ticker, tkr, period="1y", interval="1d")
+    h3y = _history_retry(ticker, tkr, period="3y", interval="1d")
 
     p10 = _adj_close(h10)
     p5 = _adj_close(h5)
     p1y = _adj_close(h1y)
     p3y = _adj_close(h3y)
 
-    price = float(p5.iloc[-1]) if not p5.empty else safe_get(info, "currentPrice")
+    # Price: prefer history -> fast_info -> Yahoo info -> FMP quote
+    fi_price = _to_float(fast_info.get("last_price") or fast_info.get("lastPrice") or fast_info.get("regularMarketPrice"))
+    price = float(p5.iloc[-1]) if not p5.empty else fi_price
     if price is None:
-        price = _fmp_get_num(fmp_data, "quote", "price")
+        price = safe_get(info, "currentPrice")
     if price is None:
         price = safe_get(info, "regularMarketPrice")
+    if price is None:
+        price = _fmp_get_num(fmp_data, "quote", "price")
+
+    # Market cap / EV early (needed for share fallback + yield metrics)
+    mcap = safe_get(info, "marketCap")
+    if mcap is None:
+        mcap = _to_float(fast_info.get("market_cap") or fast_info.get("marketCap"))
+    if mcap is None:
+        mcap = _fmp_get_num(fmp_data, "quote", "marketCap")
+
+    ev = safe_get(info, "enterpriseValue")
+    if ev is None:
+        ev = _fmp_get_num(fmp_data, "profile", "enterpriseValue")
+    if ev is None:
+        ev = _fmp_get_num(fmp_data, "key_metrics_ttm", "enterpriseValue")
+    if ev is None:
+        ev = _fmp_get_num(fmp_data, "quote", "enterpriseValue")
+    if ev is None:
+        ev = mcap
+
+    shares_out = safe_get(info, "sharesOutstanding")
+    if shares_out is None:
+        shares_out = _to_float(fast_info.get("shares") or fast_info.get("shares_outstanding"))
+    if shares_out is None:
+        shares_out = _fmp_get_num(fmp_data, "profile", "sharesOutstanding")
+    if shares_out is None and (mcap is not None) and (price not in (None, 0)):
+        shares_out = float(mcap) / float(price)
+
 
     # --- NUPL legacy (Adj Close) ---
     twap10 = twap(p10)
@@ -656,9 +750,7 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
     vwap10 = float(vwap10_series.iloc[-1]) if not vwap10_series.empty else None
     nupl_vwap10 = (price - vwap10) / price if (price and vwap10) else None
 
-    shares_out = safe_get(info, "sharesOutstanding")
-    if shares_out is None:
-        shares_out = _fmp_get_num(fmp_data, "profile", "sharesOutstanding")
+    # shares_out already derived above (with multiple fallbacks)
 
     realized_series = turnover_realized_price(p10, h10["Volume"], shares_out) if (h10 is not None and not h10.empty and "Volume" in h10.columns) else pd.Series(dtype=float)
     realized_price = float(realized_series.iloc[-1]) if not realized_series.empty else None
@@ -707,11 +799,13 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
     short_pct = safe_get(info, "shortPercentOfFloat")
     short_ratio = safe_get(info, "shortRatio")
 
-    ev = safe_get(info, "enterpriseValue")
+    if ev is None:
+        ev = safe_get(info, "enterpriseValue")
     if ev is None:
         ev = _fmp_get_num(fmp_data, "enterprise_value", "enterpriseValue")
 
-    mcap = safe_get(info, "marketCap")
+    if mcap is None:
+        mcap = safe_get(info, "marketCap")
     if mcap is None:
         mcap = _fmp_get_num(fmp_data, "quote", "marketCap")
 
@@ -903,7 +997,7 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
 
     avg_dollar_vol = None
     try:
-        h3m = tkr.history(period="3mo", interval="1d", auto_adjust=False)
+        h3m = _history_retry(ticker, tkr, period="3mo", interval="1d")
         if h3m is not None and not h3m.empty:
             px = _adj_close(h3m)
             dv = (px * h3m["Volume"]).dropna()
@@ -934,9 +1028,27 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
         notes["DAVF Downside Protection"] = f"{davf['davf_label']} (MOS={davf.get('davf_mos_pct'):.1f}%, conf={davf.get('davf_confidence')})"
 
 
-    return {
-        "__notes__": notes,
 
+    # --- Value-matrix extras (fills missing checklist metrics + adds stability metrics) ---
+    extra_metrics: Dict[str, Any] = {}
+    try:
+        extra_metrics, extra_notes = compute_value_matrix_extras(
+            info=info,
+            fmp_bundle=fmp_data,
+            price=price,
+            market_cap=mcap,
+            enterprise_value=ev,
+            annual_income=annual_income,
+            annual_cashflow=annual_cf,
+            annual_balance_sheet=annual_bs,
+            quarterly_cashflow=q_cf,
+        )
+        if extra_notes:
+            notes.update(extra_notes)
+    except Exception as e:
+        notes["Value Matrix Extras"] = f"Failed to compute extras: {e}"
+
+    metrics = {
         "Ticker": ticker,
         "Price": price,
         "Yahoo Sector": sector,
@@ -1015,3 +1127,10 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
         "DAVF Downside Protection": davf.get("davf_label"),
 
     }
+
+    # Merge extras last so they can overwrite base placeholders (e.g., previously-NA checklist metrics).
+    if extra_metrics:
+        metrics.update(extra_metrics)
+
+    metrics["__notes__"] = notes
+    return metrics
