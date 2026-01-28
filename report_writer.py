@@ -4,6 +4,7 @@ import math
 
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font
 
 from config import (
     CHECKLIST_FILE,
@@ -102,6 +103,23 @@ def reversal_fill(score: Optional[float]):
         return FILL_YELLOW
     return FILL_RED
 
+
+
+def _font_for_band(fill):
+    """Ensure readable text on colored fills.
+    - Yellow: black text
+    - Otherwise: keep header-style font (usually white) by default
+    """
+    try:
+        # openpyxl PatternFill comparison: compare start_color rgb
+        sc = getattr(fill, "start_color", None)
+        rgb = getattr(sc, "rgb", None)
+    except Exception:
+        rgb = None
+    # Common yellow in this project is a bright yellow; fall back to equality check too
+    if fill == FILL_YELLOW or (isinstance(rgb, str) and rgb.upper().endswith("FFFF00")):
+        return Font(bold=True, color="000000")
+    return FONT_HDR
 
 def conflict_flags(
     value_adj: Optional[float],
@@ -822,10 +840,13 @@ def create_report_workbook(
         ws["D8"] = "Total Combined Reversal Score %"; ws["E8"] = revpack.get("total_score_pct")
         ws["D9"] = "Flags"; ws["E9"] = flags
         ws["D10"] = "Position / Label"; ws["E10"] = f"{pos_size} | {risk_label}"
-        ws["D11"] = "Recommendation"; ws["E11"] = rec_text
-        ws["D12"] = "Eligibility"; ws["E12"] = elig.label
-        ws["D13"] = "Eligibility Notes"; ws["E13"] = elig.reasons_text(3)
-        ws["D14"] = "Data Coverage % (Overall)"; ws["E14"] = elig.overall_coverage_pct
+        # Merge eligibility + coverage into the Recommendation banner (Option A).
+        cov_pct = elig.overall_coverage_pct if isinstance(elig.overall_coverage_pct, (int, float)) else None
+        cov_str = f"{cov_pct:.1f}%" if cov_pct is not None else "NA"
+        elig_note = elig.reasons_text(2)
+        extra = f"; {elig_note}" if (elig_note and elig_note not in rec_text) else ""
+        rec_text_merged = f"{rec_text} (Eligibility: {elig.label}; Coverage: {cov_str}{extra})"
+        ws["D11"] = "Recommendation"; ws["E11"] = rec_text_merged
 
         for r in range(2, 8):
             ws[f"D{r}"].font = FONT_HDR
@@ -862,27 +883,8 @@ def create_report_workbook(
         ws["D11"].fill = FILL_HDR
         ws["D11"].alignment = ALIGN_CENTER
         ws["E11"].fill = rec_fill
-        ws["E11"].font = FONT_HDR
+        ws["E11"].font = _font_for_band(rec_fill)
         ws["E11"].alignment = ALIGN_WRAP
-
-        # Eligibility rows (in score table)
-        for rr in (12, 13, 14):
-            ws[f"D{rr}"].font = FONT_HDR
-            ws[f"D{rr}"].fill = FILL_HDR
-            ws[f"D{rr}"].alignment = ALIGN_CENTER
-            ws[f"E{rr}"].alignment = ALIGN_WRAP
-
-        # Eligibility cell fill
-        if elig.status == "PASS":
-            ws["E12"].fill = FILL_GREEN
-        elif elig.status == "WATCH":
-            ws["E12"].fill = FILL_YELLOW
-        else:
-            ws["E12"].fill = FILL_GRAY
-
-        ws["E12"].font = FONT_HDR
-        ws["E14"].fill = band_fill(ws["E14"].value)
-        ws["E14"].alignment = ALIGN_CENTER
 
         # Summary row
         ws_sum.append([
