@@ -497,13 +497,13 @@ def create_report_workbook(
         ws["A2"] = "Yahoo Sector"; ws["B2"] = m.get("Yahoo Sector")
         ws["A3"] = "Yahoo Industry"; ws["B3"] = m.get("Yahoo Industry")
         ws["A4"] = "Price"; ws["B4"] = m.get("Price")
-        ws["A5"] = "Total Combined Reversal Score %"; ws["B5"] = revpack.get("total_score_pct"); ws["B5"].fill = reversal_fill(ws["B5"].value)
+        ws["A5"] = "" ; ws["B5"] = ""
         ws["A6"] = "Data Notes"; ws["B6"] = (metric_notes.get("FMP") or "")[:4000]
 
         category_ratings: Dict[str, Dict[str, str]] = {c: {} for c in category_maps}
         category_weights: Dict[str, Dict[str, float]] = {c: {} for c in category_maps}
 
-        row = 10
+        row = 11
 
         for cat_sheet, cat_title in category_maps.items():
             ws.cell(row, 1).value = cat_title
@@ -596,8 +596,9 @@ def create_report_workbook(
         ws["D7"] = "Fund Checklist % (Adjusted)"; ws["E7"] = fund_checklist_adj
         ws["D8"] = "Flags"; ws["E8"] = flags
         ws["D9"] = "Position / Label"; ws["E9"] = f"{pos_size} | {risk_label}"
+        ws["D10"] = "Total Combined Reversal Score %"; ws["E10"] = revpack.get("total_score_pct"); ws["E10"].fill = reversal_fill(ws["E10"].value)
 
-        for r in range(2, 8):
+        for r in range(2, 11):
             ws[f"D{r}"].font = FONT_HDR
             ws[f"D{r}"].fill = FILL_HDR
             ws[f"D{r}"].alignment = ALIGN_CENTER
@@ -605,6 +606,7 @@ def create_report_workbook(
             ws[f"E{r}"].fill = band_fill(ws[f"E{r}"].value)
             ws[f"E{r}"].alignment = ALIGN_CENTER
 
+        ws["E10"].fill = reversal_fill(ws["E10"].value)
         ws["D8"].font = FONT_HDR
         ws["D8"].fill = FILL_HDR
         ws["D8"].alignment = ALIGN_CENTER
