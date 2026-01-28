@@ -112,13 +112,27 @@ def _cagr(values: List[Optional[float]]) -> Optional[float]:
 
 
 def _normalize_div_yield(div_yield_raw: Any) -> Optional[float]:
+    """Normalize dividend yield into percent points (e.g., 0.5 means 0.5%).
+
+    Yahoo usually provides a fraction (0.005). Some sources return already in percent.
+    We add sanity to avoid common 100x mis-scaling (e.g., 0.4 being treated as 40%).
+    """
     v = _to_float(div_yield_raw)
     if v is None:
         return None
-    # yahoo often returns dividendYield as fraction (0.015). Some sources return already in %.
-    if abs(v) <= 1.5:
-        return float(v) * 100.0
-    return float(v)
+
+    # Base normalization
+    pct = float(v) * 100.0 if abs(v) <= 1.5 else float(v)
+
+    # Sanity: yields >20% are rare for liquid large-caps; if we got here via the fraction branch,
+    # interpret input as already percent and undo the 100x.
+    if pct > 20.0 and abs(v) <= 1.5:
+        pct = float(v)
+
+    # Final guardrail
+    if pct < 0.0 or pct > 60.0:
+        return None
+    return pct
 
 
 def compute_value_matrix_extras(

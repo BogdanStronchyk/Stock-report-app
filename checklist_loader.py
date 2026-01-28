@@ -27,47 +27,101 @@ def _is_heading_row(metric: str) -> bool:
             "step",
             "sector id",
             "adjustments",
+            "notes",
         ]
     )
 
+def _token_set(s: str) -> set:
+    s = _norm_metric(_strip_parens(s))
+    # split on punctuation too
+    s = re.sub(r"[^a-z0-9%/\- ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return set([t for t in s.split(" ") if t])
+
 def _metric_matches(adj_metric: str, threshold_metric: str) -> bool:
-    a = _norm_metric(adj_metric)
-    t = _norm_metric(threshold_metric)
+    """Match a Sector Adjustments row metric to a category-sheet metric name.
+
+    Rules are intentionally conservative to prevent collisions like:
+      "Market Cap" accidentally matching "SBC % of Market Cap (TTM)".
+    """
+    a_raw = adj_metric or ""
+    t_raw = threshold_metric or ""
+
+    a = _norm_metric(a_raw)
+    t = _norm_metric(t_raw)
     if not a or not t:
         return False
+
+    # 1) Exact match
     if a == t:
         return True
-    # try without parentheses on either side
-    a2 = _norm_metric(_strip_parens(adj_metric))
-    t2 = _norm_metric(_strip_parens(threshold_metric))
-    if a2 and (a2 == t2):
+
+    # 2) Exact after stripping parentheses on either side
+    a2 = _norm_metric(_strip_parens(a_raw))
+    t2 = _norm_metric(_strip_parens(t_raw))
+    if a2 and a2 == t2:
         return True
-    # containment / prefix matching (handles "FCF Yield" vs "FCF Yield (TTM ...)")
-    if a2 and a2 in t:
+
+    # 3) Strong safeguards for common collisions
+    # If one mentions SBC and the other doesn't -> no match
+    if ("sbc" in a2) != ("sbc" in t2):
+        return False
+    # If one has a percent sign and the other doesn't -> no match
+    if ("%" in a2) != ("%" in t2):
+        return False
+    # If one has 'market cap' but not the other -> no match
+    if ("market cap" in a2) != ("market cap" in t2):
+        return False
+
+    # 4) Allow safe prefix / containment only for a small whitelist
+    safe_prefixes = (
+        "fcf yield",
+        "ev/fcf",
+        "margin trend",
+        "roic",
+        "share count cagr",
+        "net buyback yield",
+        "shareholder yield",
+        "short interest",
+        "days to cover",
+        "avg daily",
+        "max drawdown",
+        "realized volatility",
+        "worst weekly return",
+        "p/e",
+        "p/s",
+        "ev/ebit",
+        "ev/ebitda",
+    )
+    if any(a2.startswith(sp) for sp in safe_prefixes) or any(t2.startswith(sp) for sp in safe_prefixes):
+        if a2 and (a2 in t2 or t2 in a2):
+            return True
+
+    # 5) Token overlap similarity (conservative)
+    ta = _token_set(a_raw)
+    tt = _token_set(t_raw)
+    if not ta or not tt:
+        return False
+
+    overlap = len(ta & tt) / max(len(ta), len(tt))
+    # require very high overlap and similar length
+    if overlap >= 0.85 and abs(len(a2) - len(t2)) <= 12:
         return True
-    if a and a in t:
-        return True
-    if t2 and t2 in a:
-        return True
+
     return False
 
 
 def parse_range_cell(s: Any) -> Optional[Tuple[Optional[float], Optional[float]]]:
-    """
-    Robustly parse threshold text into (lo, hi).
+    """Robustly parse threshold text into (lo, hi).
 
-    Handles messy real-world checklist strings like:
+    Handles strings like:
       "< 15"
       "15–25"
       "> 25 or negative"
       "> 6% | otherwise ..."
       "< 3 days"
-      "3–6 days"
-      "<= 10"
-      ">= -20%"
       "$10B" / "$250M" / "$1.2T"
       "-35 to -50"
-      "-10% to -20%"
 
     Returns (None, hi) for "< hi", (lo, None) for "> lo", (lo, hi) for ranges.
     """
@@ -81,7 +135,7 @@ def parse_range_cell(s: Any) -> Optional[Tuple[Optional[float], Optional[float]]
     txt = txt.replace("–", "-").replace("—", "-")
     txt = re.sub(r"\s+", " ", txt).strip()
 
-    # Ignore purely qualitative guidance (keep this list tight)
+    # Ignore purely qualitative guidance
     low_txt = txt.lower()
     if any(w in low_txt for w in ["expanding", "stable", "contracting"]):
         return None
@@ -92,23 +146,20 @@ def parse_range_cell(s: Any) -> Optional[Tuple[Optional[float], Optional[float]]
     # Currency multipliers (only if $ is present)
     mul = 1.0
     if "$" in txt:
-        # detect suffix after a number, e.g. $10B, $250M, $1.2T
         m = re.search(rf"({_NUM})\s*([KMBT])\b", txt, flags=re.IGNORECASE)
         if m:
             suf = m.group(2).upper()
             mul = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}.get(suf, 1.0)
-            # strip the suffix letter so the remaining patterns still match
             txt = re.sub(rf"({_NUM})\s*[KMBT]\b", r"\1", txt, flags=re.IGNORECASE)
-
         txt = txt.replace("$", "").strip()
 
-    # Remove % (your metrics are already in percent units, not fractions)
+    # Remove % (metrics are stored as percent points, not fractions)
     txt = txt.replace("%", "").strip()
 
     # Normalize "to" to "-"
     txt = re.sub(r"\s+to\s+", " - ", txt, flags=re.IGNORECASE)
 
-    # 1) Comparator rule anywhere in the string (supports extra trailing words)
+    # 1) Comparator rule
     m = re.search(rf"(<=|>=|<|>)\s*({_NUM})", txt)
     if m:
         op = m.group(1)
@@ -118,7 +169,7 @@ def parse_range_cell(s: Any) -> Optional[Tuple[Optional[float], Optional[float]]
         else:
             return (num, None)
 
-    # 2) Range rule anywhere in the string (supports extra trailing words like "days")
+    # 2) Range rule
     m = re.search(rf"({_NUM})\s*-\s*({_NUM})", txt)
     if m:
         a = float(m.group(1)) * mul
@@ -210,13 +261,12 @@ def load_thresholds_from_excel(path: str) -> Dict[str, Dict[str, Dict[str, Any]]
                     for tm in list(thresholds[cat].keys()):
                         if _metric_matches(metric, tm):
                             thresholds[cat][tm][sec] = {
-
-                            "green_txt": green_txt,
-                            "yellow_txt": yellow_txt,
-                            "red_txt": red_txt,
-                            "marking": thresholds[cat][tm]["Default (All)"].get("marking"),
-                            "notes": sec_notes,
-                        }
+                                "green_txt": green_txt,
+                                "yellow_txt": yellow_txt,
+                                "red_txt": red_txt,
+                                "marking": thresholds[cat][tm]["Default (All)"].get("marking"),
+                                "notes": sec_notes,
+                            }
 
     return thresholds
 
