@@ -497,8 +497,7 @@ def create_report_workbook(
         ws["A2"] = "Yahoo Sector"; ws["B2"] = m.get("Yahoo Sector")
         ws["A3"] = "Yahoo Industry"; ws["B3"] = m.get("Yahoo Industry")
         ws["A4"] = "Price"; ws["B4"] = m.get("Price")
-        ws["A5"] = "" ; ws["B5"] = ""
-        ws["A6"] = "Data Notes"; ws["B6"] = (metric_notes.get("FMP") or "")[:4000]
+        ws["A5"] = "Data Notes"; ws["B5"] = (metric_notes.get("FMP") or "")[:4000]
 
         category_ratings: Dict[str, Dict[str, str]] = {c: {} for c in category_maps}
         category_weights: Dict[str, Dict[str, float]] = {c: {} for c in category_maps}
@@ -588,17 +587,18 @@ def create_report_workbook(
         )
 
         # Ticker headline (adjusted-only) + color bands
+        # Ticker headline (adjusted-only) + color bands
         ws["D2"] = "Valuation % (Adj)"; ws["E2"] = cat_adj["Valuation"]
         ws["D3"] = "Profitability % (Adj)"; ws["E3"] = cat_adj["Profitability"]
         ws["D4"] = "Balance Sheet % (Adj)"; ws["E4"] = cat_adj["Balance Sheet"]
         ws["D5"] = "Growth % (Adj)"; ws["E5"] = cat_adj["Growth"]
         ws["D6"] = "Risk % (Adj)"; ws["E6"] = cat_adj["Risk"]
         ws["D7"] = "Fund Checklist % (Adjusted)"; ws["E7"] = fund_checklist_adj
-        ws["D8"] = "Flags"; ws["E8"] = flags
-        ws["D9"] = "Position / Label"; ws["E9"] = f"{pos_size} | {risk_label}"
-        ws["D10"] = "Total Combined Reversal Score %"; ws["E10"] = revpack.get("total_score_pct"); ws["E10"].fill = reversal_fill(ws["E10"].value)
+        ws["D8"] = "Total Combined Reversal Score %"; ws["E8"] = revpack.get("total_score_pct")
+        ws["D9"] = "Flags"; ws["E9"] = flags
+        ws["D10"] = "Position / Label"; ws["E10"] = f"{pos_size} | {risk_label}"
 
-        for r in range(2, 11):
+        for r in range(2, 8):
             ws[f"D{r}"].font = FONT_HDR
             ws[f"D{r}"].fill = FILL_HDR
             ws[f"D{r}"].alignment = ALIGN_CENTER
@@ -606,17 +606,26 @@ def create_report_workbook(
             ws[f"E{r}"].fill = band_fill(ws[f"E{r}"].value)
             ws[f"E{r}"].alignment = ALIGN_CENTER
 
-        ws["E10"].fill = reversal_fill(ws["E10"].value)
+        # Reversal score row (special fill)
         ws["D8"].font = FONT_HDR
         ws["D8"].fill = FILL_HDR
         ws["D8"].alignment = ALIGN_CENTER
-        ws["E8"].alignment = ALIGN_WRAP
+        ws["E8"].fill = reversal_fill(ws["E8"].value)
+        ws["E8"].alignment = ALIGN_CENTER
+
+        # Flags row
         ws["D9"].font = FONT_HDR
         ws["D9"].fill = FILL_HDR
         ws["D9"].alignment = ALIGN_CENTER
         ws["E9"].alignment = ALIGN_WRAP
         if flags:
-            ws["E8"].fill = FILL_YELLOW
+            ws["E9"].fill = FILL_YELLOW
+
+        # Position row
+        ws["D10"].font = FONT_HDR
+        ws["D10"].fill = FILL_HDR
+        ws["D10"].alignment = ALIGN_CENTER
+        ws["E10"].alignment = ALIGN_WRAP
 
         # Summary row
         ws_sum.append([
