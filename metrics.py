@@ -348,7 +348,7 @@ def normalize_cycle_proxy(current_price: float, ath: float) -> Optional[float]:
 # -------------------------------------------------------------------
 # Main metrics computation
 # -------------------------------------------------------------------
-def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
+def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, Any]:
     """Compute checklist metrics + improved compound Stock NUPL v2.
 
     Adds a special key '__notes__' which maps metric name -> note string.
@@ -360,10 +360,13 @@ def compute_metrics_v2(ticker: str) -> Dict[str, Any]:
 
     notes: Dict[str, str] = {}
 
-    # --- Optional FMP fallback bundle (only if FMP_API_KEY is set) ---
-    fmp = FMPClient()
+    # --- Optional FMP fallback bundle (toggleable) ---
+    # FMP is a fallback provider. Even if FMP_API_KEY is set, you can disable it via UI / caller.
     fmp_data: Dict[str, Any] = {}
-    if fmp.enabled:
+    fmp = FMPClient()
+    if not use_fmp_fallback:
+        notes["FMP"] = "enabled=no (disabled by user)"
+    elif fmp.enabled:
         fmp_data = fmp.fetch_all(ticker) or {}
         notes["FMP"] = f"enabled=yes; requests={fmp.request_count}; last_status={fmp.last_status}; last_error={fmp.last_error}"
     else:

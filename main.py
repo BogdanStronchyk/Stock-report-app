@@ -40,10 +40,12 @@ def main():
     checklist_path = _find_checklist_file()
     thresholds = load_thresholds_from_excel(checklist_path)
 
-    raw = ask_stocks()
-    if not raw:
+    picked = ask_stocks()
+    if not picked:
         print("Canceled.")
         return
+
+    raw, use_fmp = picked
 
     parts = [p.strip() for p in raw.split(",") if p.strip()]
     resolved, unresolved = [], []
@@ -89,7 +91,7 @@ def main():
 
         for i, t in enumerate(tickers, start=1):
             prog.step(main_text=f"Fetching fundamentals ({i}/{len(tickers)})", sub_text=t)
-            metrics_by_ticker[t] = compute_metrics_v2(t)
+            metrics_by_ticker[t] = compute_metrics_v2(t, use_fmp_fallback=use_fmp)
 
             prog.step(main_text=f"Reversal scoring ({i}/{len(tickers)})", sub_text=t)
             reversal_by_ticker[t] = trend_reversal_scores(yf.Ticker(t), metrics_by_ticker[t])

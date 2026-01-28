@@ -1,15 +1,20 @@
+import os
 import tkinter as tk
 from tkinter import messagebox
-from typing import Optional
+from typing import Optional, Tuple
 
-def ask_stocks(default_text: str = "") -> Optional[str]:
+def ask_stocks(default_text: str = "") -> Optional[Tuple[str, bool]]:
     """Open a small UI window to collect stock tickers/company names.
 
     Returns:
-      - raw string (comma separated) if user clicks Generate
+      - (raw string, use_fmp_fallback) if user clicks Generate
       - None if user cancels/closes
     """
-    result = {"value": None}
+    result = {"value": None, "use_fmp": True}
+
+    # Default: enable FMP only if an API key is present
+    has_fmp_key = bool(os.environ.get("FMP_API_KEY", "").strip())
+    result["use_fmp"] = has_fmp_key
 
     root = tk.Tk()
     root.title("Stock Report App — Pick Stocks")
@@ -46,11 +51,21 @@ def ask_stocks(default_text: str = "") -> Optional[str]:
             messagebox.showwarning("Missing input", "Please enter at least one ticker or company name.")
             return
         result["value"] = raw
+        result["use_fmp"] = bool(use_fmp_var.get())
         root.destroy()
 
     def on_cancel():
         result["value"] = None
         root.destroy()
+
+    # FMP toggle (optional fallback provider)
+    use_fmp_var = tk.BooleanVar(value=result["use_fmp"])
+    chk = tk.Checkbutton(
+        root,
+        text="Use FMP fallback (requires FMP_API_KEY)",
+        variable=use_fmp_var
+    )
+    chk.pack(pady=(6, 0))
 
     btn_frame = tk.Frame(root)
     btn_frame.pack(pady=12)
@@ -66,4 +81,4 @@ def ask_stocks(default_text: str = "") -> Optional[str]:
     root.bind("<Escape>", lambda _e: on_cancel())
 
     root.mainloop()
-    return result["value"]
+    return (result["value"], bool(result.get("use_fmp", False))) if result["value"] else None
