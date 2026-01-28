@@ -66,9 +66,17 @@ def conflict_flags(
     value_adj: Optional[float],
     reversal_total: Optional[float],
     fund_adj: Optional[float],
+    davf_label: Optional[str] = None,
+    davf_mos: Optional[float] = None,
+    davf_conf: Optional[str] = None,
 ) -> str:
     """Flags for *pattern decisioning* (watchlist segmentation).
     They are NOT errors; they highlight meaningful mismatches.
+
+    Adds DAVF-aware conflicts:
+      - Reversal but no downside protection
+      - Below conservative value, but no reversal yet
+      - Extreme DAVF — base stability review required (MOS>=300 and confidence not HIGH)
     """
     HI = 60.0
     LO = 25.0
@@ -85,6 +93,7 @@ def conflict_flags(
 
     flags: List[str] = []
 
+    # Existing mismatch logic
     if v is not None and r is not None:
         if v >= HI and r <= LO:
             flags.append("🚩 Cheap but no reversal")
@@ -97,8 +106,24 @@ def conflict_flags(
         if r >= HI and f <= 40.0:
             flags.append("⚠ Strong confirmation, weak fundamentals")
 
-    return " | ".join(flags)
+    # DAVF-aware flags
+    d = (davf_label or "NA").upper().strip()
+    conf = (davf_conf or "NA").upper().strip()
+    mos = _f(davf_mos)
 
+    # A) Reversal without protection (timing works, but downside not protected)
+    if r is not None and r >= HI and d in ("RED", "NA"):
+        flags.append("🚩 Reversal but no downside protection")
+
+    # B) Below conservative value, but no confirmation yet (classic watchlist)
+    if d == "GREEN" and (r is None or r < 40.0):
+        flags.append("🚩 Below conservative value, but no reversal yet")
+
+    # C) Extreme DAVF: treat as investigation signal unless confidence HIGH
+    if mos is not None and mos >= 300.0 and conf != "HIGH":
+        flags.append("🚩 Extreme DAVF — base stability review required")
+
+    return " | ".join(flags)
 
 def position_guidance(
     fund_adj: Optional[float],
@@ -107,9 +132,12 @@ def position_guidance(
     balance_adj: Optional[float],
     risk_adj: Optional[float],
     flags: str,
+    davf_label: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Returns (position_size, label) where label ∈ {OK, CAUTION, AVOID}.
     Decision support only.
+
+    DAVF acts as a *risk cap*: it never boosts size, only limits it.
     """
     def _f(x):
         try:
@@ -123,22 +151,86 @@ def position_guidance(
     b = _f(balance_adj)
     k = _f(risk_adj)
 
+    # Base sizing logic (existing)
     if (f is not None and f < 20.0) or (b is not None and b < 20.0) or (k is not None and k < 20.0):
-        return ("0% (avoid)", "AVOID")
+        base_pos, base_label = ("0% (avoid)", "AVOID")
+    else:
+        base_label = "OK"
+        if (flags or "") or (f is not None and f < 40.0) or (r is not None and r < 50.0):
+            base_label = "CAUTION"
 
-    label = "OK"
-    if (flags or "") or (f is not None and f < 40.0) or (r is not None and r < 50.0):
-        label = "CAUTION"
+        if (f is not None and f >= 70.0) and (r is not None and r >= 75.0) and (v is None or v >= 40.0):
+            base_pos, base_label = ("3–5% (high conviction)", base_label)
+        elif (f is not None and f >= 60.0) and (r is not None and r >= 60.0) and (v is None or v >= 25.0):
+            base_pos, base_label = ("1–3% (core)", base_label)
+        else:
+            base_pos, base_label = ("0.5–1% (starter)", base_label)
 
-    if (f is not None and f >= 70.0) and (r is not None and r >= 75.0) and (v is None or v >= 40.0):
-        return ("3–5% (high conviction)", label)
+    # DAVF cap (risk governor)
+    d = (davf_label or "NA").upper().strip()
 
-    if (f is not None and f >= 60.0) and (r is not None and r >= 60.0) and (v is None or v >= 25.0):
-        return ("1–3% (core)", label)
+    # Helper: keep label at least CAUTION for capped sizing
+    def _cap(pos_txt: str, lbl: str):
+        lbl2 = lbl
+        if lbl2 == "OK":
+            lbl2 = "CAUTION"
+        return (pos_txt, lbl2)
 
-    return ("0.5–1% (starter)", label)
+    if d == "RED":
+        # No downside protection -> speculative only
+        return _cap("≤0.5% (DAVF cap)", "CAUTION") if base_label != "AVOID" else ("0% (avoid)", "AVOID")
+
+    if d == "NA":
+        # Unreliable DAVF -> manual underwriting; keep minimal
+        return _cap("0–0.5% (manual)", "CAUTION") if base_label != "AVOID" else ("0% (avoid)", "AVOID")
+
+    if d == "YELLOW":
+        # Partial buffer -> cap anything above starter
+        bp = (base_pos or "").lower()
+        if "starter" in bp or "0.5" in bp:
+            return (base_pos, base_label)
+        return _cap("1–2% (DAVF cap)", base_label)
+
+    # GREEN -> no cap
+    return (base_pos, base_label)
 
 
+def final_recommendation_banner(
+    davf_label: Optional[str],
+    fund_adj: Optional[float],
+    reversal_total: Optional[float],
+    risk_label: str,
+) -> Tuple[str, Any]:
+    """Return (banner_text, fill) for a single-line recommendation banner.
+    DAVF governs risk tone; reversal governs timing; fundamentals govern quality.
+    """
+    def _f(x):
+        try:
+            return None if x is None else float(x)
+        except Exception:
+            return None
+
+    d = (davf_label or "NA").upper().strip()
+    f = _f(fund_adj)
+    r = _f(reversal_total)
+
+    if d == "NA":
+        return ("⚠ REVIEW — DAVF uncertain (manual underwriting)", FILL_GRAY)
+
+    if d == "RED":
+        if f is not None and f >= 65.0:
+            return ("🟡 HOLD — Quality at a price (no downside protection)", FILL_YELLOW)
+        return ("❌ AVOID — No downside protection at current price", FILL_RED)
+
+    if d == "YELLOW":
+        if r is not None and r >= 60.0:
+            return ("⚠ STARTER — Improving, partial downside buffer", FILL_YELLOW)
+        return ("⚠ WATCH — Some value, confirmation incomplete", FILL_YELLOW)
+
+    # GREEN
+    if r is not None and r >= 60.0:
+        return ("✅ ACCUMULATE — Downside protected + improving", FILL_GREEN)
+    return ("⚠ WATCH — Below conservative value, wait for confirmation", FILL_YELLOW)
 
 def autosize(ws):
     for col in ws.columns:
@@ -473,6 +565,8 @@ def create_report_workbook(
         "Flags",
         "Position Size",
         "Risk Label",
+        "DAVF Downside Protection",
+        "Recommendation",
     ])
     for cell in ws_sum[1]:
         cell.fill = FILL_HDR
@@ -507,7 +601,7 @@ def create_report_workbook(
         category_ratings: Dict[str, Dict[str, str]] = {c: {} for c in category_maps}
         category_weights: Dict[str, Dict[str, float]] = {c: {} for c in category_maps}
 
-        row = 11
+        row = 12
 
         for cat_sheet, cat_title in category_maps.items():
             ws.cell(row, 1).value = cat_title
@@ -581,14 +675,27 @@ def create_report_workbook(
             cat_adj[cat] = adjusted_from_raw_and_coverage(raw, cov)
 
         fund_checklist_adj = _weighted_blend(cat_adj)
-        flags = conflict_flags(cat_adj.get("Valuation"), revpack.get("total_score_pct"), fund_checklist_adj)
+        davf_label = m.get("DAVF Downside Protection") or "NA"
+        davf_mos = m.get("DAVF MOS vs Floor (%)")
+        davf_conf = m.get("DAVF Confidence") or "NA"
+        flags = conflict_flags(cat_adj.get("Valuation"), revpack.get("total_score_pct"), fund_checklist_adj,
+                               davf_label=davf_label, davf_mos=davf_mos, davf_conf=davf_conf)
         pos_size, risk_label = position_guidance(
+
             fund_adj=fund_checklist_adj,
             value_adj=cat_adj.get("Valuation"),
             reversal_total=revpack.get("total_score_pct"),
             balance_adj=cat_adj.get("Balance Sheet"),
             risk_adj=cat_adj.get("Risk"),
             flags=flags,
+            davf_label=davf_label,
+        )
+
+        rec_text, rec_fill = final_recommendation_banner(
+            davf_label=davf_label,
+            fund_adj=fund_checklist_adj,
+            reversal_total=revpack.get("total_score_pct"),
+            risk_label=risk_label,
         )
 
         # Ticker headline (adjusted-only) + color bands
@@ -602,6 +709,7 @@ def create_report_workbook(
         ws["D8"] = "Total Combined Reversal Score %"; ws["E8"] = revpack.get("total_score_pct")
         ws["D9"] = "Flags"; ws["E9"] = flags
         ws["D10"] = "Position / Label"; ws["E10"] = f"{pos_size} | {risk_label}"
+        ws["D11"] = "Recommendation"; ws["E11"] = rec_text
 
         for r in range(2, 8):
             ws[f"D{r}"].font = FONT_HDR
@@ -632,6 +740,15 @@ def create_report_workbook(
         ws["D10"].alignment = ALIGN_CENTER
         ws["E10"].alignment = ALIGN_WRAP
 
+
+        # Recommendation row (in score table)
+        ws["D11"].font = FONT_HDR
+        ws["D11"].fill = FILL_HDR
+        ws["D11"].alignment = ALIGN_CENTER
+        ws["E11"].fill = rec_fill
+        ws["E11"].font = FONT_HDR
+        ws["E11"].alignment = ALIGN_WRAP
+
         # Summary row
         ws_sum.append([
             t,
@@ -653,6 +770,9 @@ def create_report_workbook(
             fund_checklist_adj,
             flags,
             pos_size,
+            risk_label,
+            davf_label,
+            rec_text,
         ])
 
         
@@ -678,6 +798,20 @@ def create_report_workbook(
             ws_sum.cell(sr, 20).fill = FILL_YELLOW
         else:
             ws_sum.cell(sr, 20).fill = FILL_GREEN
+
+        # DAVF protection column = 21
+        dl = (davf_label or "NA").upper().strip()
+        if dl == "GREEN":
+            ws_sum.cell(sr, 21).fill = FILL_GREEN
+        elif dl == "YELLOW":
+            ws_sum.cell(sr, 21).fill = FILL_YELLOW
+        elif dl == "RED":
+            ws_sum.cell(sr, 21).fill = FILL_RED
+        else:
+            ws_sum.cell(sr, 21).fill = FILL_GRAY
+
+        # Recommendation column = 22
+        ws_sum.cell(sr, 22).alignment = ALIGN_WRAP
 
         # Reversal blocks
         row = _write_reversal_block(
