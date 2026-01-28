@@ -21,6 +21,44 @@ from scoring import (
 # =========================
 # Display helpers
 
+def _is_percent_like_metric(metric: str, th: Optional[Dict[str, Any]]) -> bool:
+    """Return True if the metric should be displayed with a % sign.
+
+    IMPORTANT: Values are stored as *percentage points* (e.g. 12.3 means 12.3%),
+    so we use a custom number format 0.00"%" (NOT Excel % scaling).
+    """
+    if not metric:
+        return False
+    m = metric.lower()
+
+    # If checklist thresholds include '%', it's almost certainly a percent-point metric.
+    if th:
+        for k in ("green_txt", "yellow_txt", "red_txt"):
+            s = th.get(k)
+            if isinstance(s, str) and "%" in s:
+                return True
+
+    if "%" in metric:
+        return True
+
+    tokens = [
+        "cagr", "yield", "margin", "drawdown", "volatility",
+        "short interest", "dividend", "buyback", "shareholder",
+        "trend", "Δ", "delta", "roic", "roe",
+    ]
+    return any(t in m for t in tokens)
+
+
+def _apply_metric_value_format(cell, metric: str, val: Any, th: Optional[Dict[str, Any]]):
+    if val is None or not isinstance(val, (int, float)):
+        return
+    if _is_percent_like_metric(metric, th):
+        cell.number_format = '0.00"%"'
+        return
+    # default: 2 decimals for readability
+    cell.number_format = "0.00"
+
+
 def band_fill(score: Optional[float]):
     """Decision-band coloring for adjusted scores (categories + adjusted overall).
     Bands:
@@ -444,11 +482,6 @@ def _metric_weight(category: str, metric: str) -> float:
             w = 1.3
         elif "Avg Daily $ Volume" in m:
             w = 1.2
-
-        elif "SBC % of Market Cap" in m or "SBC % of FCF" in m:
-            w = 1.3
-        elif "Share Count CAGR" in m or "Net Buyback Yield" in m or "Shareholder Yield" in m:
-            w = 1.2
         elif "Beta" in m:
             w = 1.0
         elif "Short Interest" in m or "Days to Cover" in m:
@@ -478,18 +511,19 @@ def _apply_category_caps(category: str, raw_score: Optional[float], ratings_by_m
 
 
 def _weighted_blend(values_by_category: Dict[str, Optional[float]]) -> Optional[float]:
-    """Weighted blend across categories.
+    """Weighted overall adjusted checklist score.
 
-    IMPORTANT: Missing categories are treated as 0 (penalty), not ignored.
-    This prevents a report from looking artificially strong when data is missing.
+    IMPORTANT: Missing categories (None) are treated as 0 to penalize missing data,
+    instead of silently dropping weights and inflating the result.
     """
-    wsum = 0.0
     acc = 0.0
+    wsum = 0.0
     for cat, w in CATEGORY_WEIGHTS.items():
-        wsum += float(w)
+        w = float(w)
         v = values_by_category.get(cat)
-        v2 = 0.0 if v is None else float(v)
-        acc += float(w) * v2
+        v = 0.0 if v is None else float(v)
+        wsum += w
+        acc += w * v
     return None if wsum == 0 else (acc / wsum)
 
 
@@ -580,15 +614,7 @@ def _add_cheat_sheet(wb: Workbook):
     ws["A42"] = "❌ AVOID"
     ws["A43"] = "  No downside protection and/or weak fundamentals."
 
-
-    ws["A45"] = "New / fixed metrics in this version"
-    ws["A46"] = "Shareholder Yield = Dividend Yield + Net Buyback Yield (3Y avg). Higher is better."
-    ws["A47"] = "Margin Trend (3–5Y) = change in operating margin (percentage points). Higher is better."
-    ws["A48"] = "EV/FCF (Normalized 5Y Median) and FCF Yield (Normalized) reduce one-off distortions in FCF."
-    ws["A49"] = "Share Count CAGR (3Y) and SBC burden show dilution pressure (lower is better)."
-    ws["A50"] = "If Risk metrics are all NA, the app likely failed to fetch price history (rate limit / connectivity)."
-
-    for r in range(1, 51):
+    for r in range(1, 45):
         ws[f"A{r}"].alignment = ALIGN_WRAP
 
     ws.column_dimensions["A"].width = 105
@@ -638,7 +664,7 @@ def create_report_workbook(
 
         ws = wb.create_sheet(t)
 
-        ws["A1"] = f"{t} — Checklist ({CHECKLIST_FILE}) — Sector-adjusted: {bucket}"
+        ws["A1"] = f"{t} — Checklist: {CHECKLIST_FILE.replace('.xlsx', '')} (Sector-adjusted): {bucket}"
         ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=6)
 
         ws["A2"] = "Yahoo Sector"; ws["B2"] = m.get("Yahoo Sector")
@@ -706,6 +732,7 @@ def create_report_workbook(
 
                 ws.cell(row, 1).value = metric
                 ws.cell(row, 2).value = val
+                _apply_metric_value_format(ws.cell(row, 2), metric, val, th)
                 ws.cell(row, 3).value = rating
                 ws.cell(row, 4).value = mode
                 ws.cell(row, 5).value = _limits_text(th)
@@ -725,12 +752,9 @@ def create_report_workbook(
         for cat in category_maps.values():
             raw, cov = compute_category_score_and_coverage(category_ratings[cat], category_weights[cat])
             raw = _apply_category_caps(cat, raw, category_ratings[cat])
-            adj = adjusted_from_raw_and_coverage(raw, cov)
-            cat_adj[cat] = 0.0 if adj is None else adj
+            cat_adj[cat] = adjusted_from_raw_and_coverage(raw, cov)
 
         fund_checklist_adj = _weighted_blend(cat_adj)
-        if fund_checklist_adj is None:
-            fund_checklist_adj = 0.0
         davf_label = m.get("DAVF Downside Protection") or "NA"
         davf_mos = m.get("DAVF MOS vs Floor (%)")
         davf_conf = m.get("DAVF Confidence") or "NA"
