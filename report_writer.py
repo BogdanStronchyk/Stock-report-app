@@ -503,7 +503,7 @@ def create_report_workbook(
         ws["A7"] = "DAVF MOS vs Floor (%)"; ws["B7"] = m.get("DAVF MOS vs Floor (%)")
         ws["A8"] = "DAVF Confidence"; ws["B8"] = m.get("DAVF Confidence")
         ws["A9"] = "DAVF Notes"; ws["B9"] = (metric_notes.get("DAVF") or "")[:4000]
-
+        ws["A10"] = "DAVF Downside Protection"; ws["B10"] = m.get("DAVF Downside Protection")
         category_ratings: Dict[str, Dict[str, str]] = {c: {} for c in category_maps}
         category_weights: Dict[str, Dict[str, float]] = {c: {} for c in category_maps}
 

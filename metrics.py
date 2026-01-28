@@ -21,6 +21,33 @@ _MULTIPLIERS = {
     "T": 1e12,
 }
 
+def davf_protection_label(mos_pct: Optional[float], confidence: str) -> str:
+    """
+    Interpretation label for DAVF MOS vs Floor (%).
+    Conservative by design:
+      - If LOW confidence → return "NA" (forces manual review)
+      - Else:
+          >= 40%  -> "GREEN"
+          15-40%  -> "YELLOW"
+          < 15%   -> "RED"
+    """
+    if mos_pct is None:
+        return "NA"
+    if (confidence or "NA").upper() == "LOW":
+        return "NA"
+
+    try:
+        m = float(mos_pct)
+    except Exception:
+        return "NA"
+
+    if m >= 40.0:
+        return "GREEN"
+    if m >= 15.0:
+        return "YELLOW"
+    return "RED"
+
+
 # -------------------------------------------------------------------
 # DAVF (Downside-Anchored Value Floor)
 # -------------------------------------------------------------------
@@ -131,6 +158,8 @@ def compute_davf(
         "davf_multiple": None,
         "davf_haircut_pct": None,
         "davf_note": "",
+        "davf_label": "NA",
+
     }
 
     if price in (None, 0) or shares_out in (None, 0):
@@ -229,6 +258,7 @@ def compute_davf(
 
     mos = (float(floor_ps) / float(price) - 1.0) * 100.0
     out["davf_mos_pct"] = float(mos)
+    out["davf_label"] = davf_protection_label(out["davf_mos_pct"], out["davf_confidence"])
 
     # Note
     note_bits = [f"Base={base_type}", f"Mult={mult:.1f}"]
@@ -900,6 +930,8 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
     # Add to notes so it shows up in report (Notes column + header block)
     if davf.get("davf_note"):
         notes["DAVF"] = davf["davf_note"]
+    if davf.get("davf_label") and davf.get("davf_label") != "NA":
+        notes["DAVF Downside Protection"] = f"{davf['davf_label']} (MOS={davf.get('davf_mos_pct'):.1f}%, conf={davf.get('davf_confidence')})"
 
 
     return {
@@ -980,5 +1012,6 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
         "DAVF Base Type": davf.get("davf_base_type"),
         "DAVF Multiple Used": davf.get("davf_multiple"),
         "DAVF Haircut (%)": davf.get("davf_haircut_pct"),
+        "DAVF Downside Protection": davf.get("davf_label"),
 
     }
