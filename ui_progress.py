@@ -2,6 +2,7 @@ import os
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+
 class ProgressWindow:
     """Small always-on-top progress window for report generation."""
 
@@ -11,7 +12,7 @@ class ProgressWindow:
 
         self.root = tk.Tk()
         self.root.title(title)
-        self.root.geometry("520x160")
+        self.root.geometry("520x178")
         self.root.resizable(False, False)
 
         try:
@@ -30,21 +31,37 @@ class ProgressWindow:
         self.sub = tk.Label(self.root, text="", font=("Segoe UI", 9))
         self.sub.pack(pady=(6, 0))
 
+        # Rolling progress stats line (e.g., per-ticker timing)
+        self.done = tk.Label(self.root, text="", font=("Segoe UI", 9), fg="#555555")
+        self.done.pack(pady=(4, 0))
+
         self.root.update_idletasks()
         self.root.update()
 
     def set_status(self, main_text: str, sub_text: str = ""):
+        """Update text without advancing the progress bar."""
         self.label.config(text=main_text)
         self.sub.config(text=sub_text)
         self.root.update_idletasks()
         self.root.update()
 
-    def step(self, main_text: str = None, sub_text: str = ""):
+    def set_done(self, text: str = ""):
+        self.done.config(text=text)
+        self.root.update_idletasks()
+        self.root.update()
+
+    def step(self, main_text: str = None, sub_text: str = "", done_text: str = None):
+        """Advance the progress bar by 1 step and update labels."""
         self.current = min(self.total_steps, self.current + 1)
         self.pb["value"] = self.current
+
         if main_text is not None:
             self.label.config(text=main_text)
         self.sub.config(text=sub_text)
+
+        if done_text is not None:
+            self.done.config(text=done_text)
+
         self.root.update_idletasks()
         self.root.update()
 

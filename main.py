@@ -3,6 +3,7 @@ import os
 import sys
 import warnings
 from datetime import datetime
+from time import perf_counter
 
 import yfinance as yf
 
@@ -15,6 +16,19 @@ from report_writer import create_report_workbook
 from ui_dialogs import ask_output_directory
 from ui_stock_picker import ask_stocks
 from ui_progress import ProgressWindow, success_popup
+
+
+def _fmt_seconds(sec: float) -> str:
+    sec = max(0.0, float(sec))
+    if sec < 60:
+        return f"{sec:.1f}s"
+    m = int(sec // 60)
+    s = sec - m * 60
+    if m < 60:
+        return f"{m}m {s:0.0f}s"
+    h = int(m // 60)
+    m2 = m - h * 60
+    return f"{h}h {m2}m"
 
 
 def _resource_path(relative_path: str) -> str:
@@ -89,13 +103,27 @@ def main():
     try:
         prog.set_status("Fetching data...", f"Tickers: {', '.join(tickers)}")
 
+        fetch_durations = []
+
         for i, t in enumerate(tickers, start=1):
-            prog.step(main_text=f"Fetching fundamentals ({i}/{len(tickers)})", sub_text=t)
+            # --- Fetch fundamentals (timed per ticker) ---
+            main_txt = f"Fetching fundamentals ({i}/{len(tickers)})"
+            prog.set_status(main_txt, t)
+            t0 = perf_counter()
             metrics_by_ticker[t] = compute_metrics_v2(t, use_fmp_fallback=use_fmp)
+            dt = perf_counter() - t0
+            fetch_durations.append(dt)
+            avg = sum(fetch_durations) / len(fetch_durations)
+            remaining = max(0, len(tickers) - i)
+            eta = remaining * avg
+            done_txt = f"Done: {i}/{len(tickers)} | Fetch ({t}): {_fmt_seconds(dt)} | Avg: {_fmt_seconds(avg)} | ETA: {_fmt_seconds(eta)}"
+            prog.step(main_text=main_txt, sub_text=t, done_text=done_txt)
 
-            prog.step(main_text=f"Reversal scoring ({i}/{len(tickers)})", sub_text=t)
+            # --- Reversal scoring (keeps the same done stats line) ---
+            rev_txt = f"Reversal scoring ({i}/{len(tickers)})"
+            prog.set_status(rev_txt, t)
             reversal_by_ticker[t] = trend_reversal_scores(yf.Ticker(t), metrics_by_ticker[t])
-
+            prog.step(main_text=rev_txt, sub_text=t, done_text=done_txt)
         prog.step(main_text="Writing Excel report...", sub_text="Applying checklist + scores + colors")
         create_report_workbook(
             tickers=tickers,
