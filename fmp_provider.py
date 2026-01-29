@@ -12,13 +12,15 @@ from typing import Any, Dict, Optional
 class FMPClient:
     """Financial Modeling Prep fallback client.
 
-    IMPORTANT: FMP has *two* URL styles:
-      - Legacy v3 style: /api/v3/<endpoint>/<SYMBOL>?period=quarter&limit=...&apikey=...
-      - Stable style:     /stable/<endpoint>?symbol=SYMBOL&apikey=...
+    IMPORTANT (post Aug 31, 2025): FMP's legacy `/api/v3/...` endpoints are
+    blocked for non-legacy accounts.
 
-    This client primarily uses the v3 style for statements and enterprise values,
-    because those endpoints are clearly documented with the symbol in the path.
-    For TTM ratios/key-metrics, we try v3 first and then stable as a fallback.
+    This client uses the **stable** API exclusively:
+
+        https://financialmodelingprep.com/stable/<endpoint>?symbol=SYMBOL&apikey=...
+
+    If you see HTTP 400/403 responses, the JSON body usually explains whether the
+    issue is a plan restriction, an invalid symbol, or a bad/expired key.
 
     Performance/budget features:
       - Optional on-disk cache (default ON, TTL 24h) to avoid repeat calls.
@@ -48,6 +50,30 @@ class FMPClient:
         self.max_retries = self._safe_int(os.environ.get("FMP_MAX_RETRIES", "2"), default=2)  # extra attempts
         self.backoff_base = self._safe_float(os.environ.get("FMP_BACKOFF_BASE", "1.2"), default=1.2)
 
+        # Many plans restrict quarterly statements. Default to annual-only unless explicitly enabled.
+        self.use_quarterly = (os.environ.get("FMP_USE_QUARTERLY", "0") or "0").strip().lower() in ("1", "true", "yes")
+
+        # Statement pagination limits
+        #
+        # Some subscriptions restrict the allowed values for the `limit` parameter (commonly <= 5).
+        # Keep this configurable but capped to 5 by default to avoid HTTP 402 "Premium Query Parameter" errors.
+        self.statement_limit = self._safe_int(os.environ.get("FMP_STATEMENT_LIMIT", "5"), default=5)
+        # Hard cap at 5 unless you change code (matches your current plan restriction).
+        self.statement_limit = max(0, min(5, self.statement_limit))
+
+    def _cap_limit(self, desired: int) -> Optional[int]:
+        """Return a subscription-safe `limit` value.
+
+        If statement_limit <= 0, omit the `limit` parameter entirely (API default).
+        """
+        try:
+            desired_i = int(desired)
+        except Exception:
+            desired_i = 0
+        if self.statement_limit <= 0:
+            return None
+        return min(max(0, desired_i), self.statement_limit)
+
     @staticmethod
     def _safe_int(v: str, default: int = 0) -> int:
         try:
@@ -71,19 +97,14 @@ class FMPClient:
     # -----------------------
     # URL builders
     # -----------------------
-    def _v3_url(self, endpoint: str, symbol: Optional[str] = None, params: Optional[Dict[str, Any]] = None) -> str:
-        params = dict(params or {})
-        params["apikey"] = self.api_key
-        qs = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
-        if symbol:
-            return f"https://financialmodelingprep.com/api/v3/{endpoint}/{symbol}?{qs}"
-        return f"https://financialmodelingprep.com/api/v3/{endpoint}?{qs}"
-
     def _stable_url(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> str:
         params = dict(params or {})
         params["apikey"] = self.api_key
         qs = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
-        return f"https://financialmodelingprep.com/stable/{endpoint}?{qs}"
+        base = (os.environ.get("FMP_BASE_URL") or "https://financialmodelingprep.com/stable/").strip()
+        base = base.rstrip("/")
+        endpoint = (endpoint or "").lstrip("/")
+        return f"{base}/{endpoint}?{qs}"
 
     # -----------------------
     # Cache (disk)
@@ -159,6 +180,8 @@ class FMPClient:
         cached = self._cache_get(url)
         if cached is not None:
             self.last_status = 200
+            # Avoid confusing state like last_status=200 with a stale last_error from earlier.
+            self.last_error = None
             return cached
 
         headers = {
@@ -181,6 +204,8 @@ class FMPClient:
                     if not raw:
                         return None
                     payload = json.loads(raw)
+                    # Successful call clears previous errors.
+                    self.last_error = None
                     self._cache_set(url, payload)
                     return payload
 
@@ -201,14 +226,25 @@ class FMPClient:
                 except Exception:
                     pass
 
-                if e.code == 403:
-                    self.last_error = (
-                        "HTTP 403 Forbidden from FMP. Possible causes: invalid/expired API key, "
-                        "plan restriction for this endpoint, or access blocked."
-                    )
-                    return None
-                if e.code == 401:
-                    self.last_error = "HTTP 401 Unauthorized from FMP (API key invalid)."
+                # Best-effort parse of JSON error bodies (FMP often returns: {"Error Message": "..."}).
+                msg = None
+                if body:
+                    try:
+                        j = json.loads(body)
+                        if isinstance(j, dict):
+                            msg = j.get("Error Message") or j.get("error") or j.get("message")
+                    except Exception:
+                        msg = None
+
+                if e.code in (401, 403):
+                    base = f"HTTP {e.code} {'Unauthorized' if e.code == 401 else 'Forbidden'} from FMP"
+                    if msg:
+                        self.last_error = f"{base}: {msg}"
+                    else:
+                        self.last_error = (
+                            f"{base}. Possible causes: invalid/expired API key, plan restriction, "
+                            "or access blocked."
+                        )
                     return None
 
                 if e.code == 429:
@@ -228,7 +264,10 @@ class FMPClient:
                     self._sleep_backoff(attempt)
                     continue
 
-                self.last_error = f"HTTP {e.code} error from FMP. Response: {body[:200]}"
+                if msg:
+                    self.last_error = f"HTTP {e.code} error from FMP: {msg}"
+                else:
+                    self.last_error = f"HTTP {e.code} error from FMP. Response: {body[:200]}"
                 if self.debug:
                     print(f"[FMP] ERROR {e.code}: {self.last_error}")
                 return None
@@ -284,45 +323,65 @@ class FMPClient:
 
         data: Dict[str, Any] = {}
 
-        data["profile"] = self._get_json(self._v3_url("profile", symbol, {})) or [] if need_profile else []
-        data["quote"] = self._get_json(self._v3_url("quote", symbol, {})) or [] if need_quote else []
+        def _get(endpoint: str, params: Dict[str, Any]) -> Optional[Any]:
+            return self._get_json(self._stable_url(endpoint, params))
 
-        data["income_a"] = (
-            self._get_json(self._v3_url("income-statement", symbol, {"period": "annual", "limit": 6})) or []
-            if need_income_annual else []
-        )
-        data["income_q"] = (
-            self._get_json(self._v3_url("income-statement", symbol, {"period": "quarter", "limit": 8})) or []
-            if need_income_quarter else []
-        )
-        data["cashflow_q"] = (
-            self._get_json(self._v3_url("cash-flow-statement", symbol, {"period": "quarter", "limit": 8})) or []
-            if need_cashflow_quarter else []
-        )
-        data["balance_a"] = (
-            self._get_json(self._v3_url("balance-sheet-statement", symbol, {"period": "annual", "limit": 2})) or []
-            if need_balance_annual else []
-        )
-        data["enterprise_value"] = (
-            self._get_json(self._v3_url("enterprise-values", symbol, {"limit": 2})) or []
-            if need_enterprise_value else []
-        )
-
-        if need_ratios_ttm:
-            ratios = self._get_json(self._v3_url("ratios-ttm", symbol, {}))
-            if ratios is None:
-                ratios = self._get_json(self._stable_url("ratios-ttm", {"symbol": symbol}))
-            data["ratios_ttm"] = ratios or []
+        # Profile / Quote
+        data["profile"] = _get("profile", {"symbol": symbol}) or [] if need_profile else []
+        if need_quote:
+            q = _get("quote", {"symbol": symbol})
+            if q is None:
+                # Some plans expose quote-short but not full quote.
+                q = _get("quote-short", {"symbol": symbol})
+            data["quote"] = q or []
         else:
-            data["ratios_ttm"] = []
+            data["quote"] = []
 
-        if need_key_metrics_ttm:
-            km = self._get_json(self._v3_url("key-metrics-ttm", symbol, {}))
-            if km is None:
-                km = self._get_json(self._stable_url("key-metrics-ttm", {"symbol": symbol}))
-            data["key_metrics_ttm"] = km or []
+        # Statements / enterprise values
+        if need_income_annual:
+            ia = _get("income-statement", {"symbol": symbol, "period": "annual", "limit": self._cap_limit(6)})
+            if ia is None:
+                ia = _get("income-statement", {"symbol": symbol, "limit": self._cap_limit(6)})
+            data["income_a"] = ia or []
         else:
-            data["key_metrics_ttm"] = []
+            data["income_a"] = []
+
+        if need_income_quarter:
+            iq = _get("income-statement", {"symbol": symbol, "period": "quarter", "limit": self._cap_limit(8)})
+            if iq is None:
+                # Fallback to annual if quarterly is restricted.
+                iq = _get("income-statement", {"symbol": symbol, "period": "annual", "limit": self._cap_limit(8)})
+            data["income_q"] = iq or []
+        else:
+            data["income_q"] = []
+
+        if need_cashflow_quarter:
+            cq = _get("cash-flow-statement", {"symbol": symbol, "period": "quarter", "limit": self._cap_limit(8)})
+            if cq is None:
+                cq = _get("cash-flow-statement", {"symbol": symbol, "period": "annual", "limit": self._cap_limit(8)})
+            data["cashflow_q"] = cq or []
+        else:
+            data["cashflow_q"] = []
+
+        if need_balance_annual:
+            ba = _get("balance-sheet-statement", {"symbol": symbol, "period": "annual", "limit": self._cap_limit(2)})
+            if ba is None:
+                ba = _get("balance-sheet-statement", {"symbol": symbol, "limit": self._cap_limit(2)})
+            data["balance_a"] = ba or []
+        else:
+            data["balance_a"] = []
+
+        if need_enterprise_value:
+            ev = _get("enterprise-values", {"symbol": symbol, "limit": self._cap_limit(2)})
+            if ev is None:
+                ev = _get("enterprise-values", {"symbol": symbol})
+            data["enterprise_value"] = ev or []
+        else:
+            data["enterprise_value"] = []
+
+        # TTM endpoints
+        data["ratios_ttm"] = _get("ratios-ttm", {"symbol": symbol}) or [] if need_ratios_ttm else []
+        data["key_metrics_ttm"] = _get("key-metrics-ttm", {"symbol": symbol}) or [] if need_key_metrics_ttm else []
 
         return data
 
@@ -360,35 +419,19 @@ class FMPClient:
         return self.fetch_all(symbol)
 
     def fetch_all(self, symbol: str) -> Dict[str, Any]:
-        """Original 'full' bundle (kept for backwards compatibility)."""
-        if not self.enabled:
-            return {}
+        """Full bundle (kept for backwards compatibility).
 
-        data: Dict[str, Any] = {}
-
-        # Profile/Quote (v3) for market cap/volume/price fallbacks
-        data["profile"] = self._get_json(self._v3_url("profile", symbol, {})) or []
-        data["quote"] = self._get_json(self._v3_url("quote", symbol, {})) or []
-
-        # Statements (v3 format with symbol in path)
-        data["income_a"] = self._get_json(self._v3_url("income-statement", symbol, {"period": "annual", "limit": 6})) or []
-        data["income_q"] = self._get_json(self._v3_url("income-statement", symbol, {"period": "quarter", "limit": 8})) or []
-        data["cashflow_q"] = self._get_json(self._v3_url("cash-flow-statement", symbol, {"period": "quarter", "limit": 8})) or []
-        data["balance_a"] = self._get_json(self._v3_url("balance-sheet-statement", symbol, {"period": "annual", "limit": 2})) or []
-
-        # Enterprise values (v3)
-        data["enterprise_value"] = self._get_json(self._v3_url("enterprise-values", symbol, {"limit": 2})) or []
-
-        # TTM ratios + key metrics:
-        # Try v3 first (symbol in path) then stable (symbol query param).
-        ratios_v3 = self._get_json(self._v3_url("ratios-ttm", symbol, {}))
-        if ratios_v3 is None:
-            ratios_v3 = self._get_json(self._stable_url("ratios-ttm", {"symbol": symbol}))
-        data["ratios_ttm"] = ratios_v3 or []
-
-        km_v3 = self._get_json(self._v3_url("key-metrics-ttm", symbol, {}))
-        if km_v3 is None:
-            km_v3 = self._get_json(self._stable_url("key-metrics-ttm", {"symbol": symbol}))
-        data["key_metrics_ttm"] = km_v3 or []
-
-        return data
+        NOTE: This is stable-only (no legacy `/api/v3/...` calls).
+        """
+        return self.fetch_minimal(
+            symbol,
+            need_profile=True,
+            need_quote=True,
+            need_income_annual=True,
+            need_income_quarter=self.use_quarterly,
+            need_cashflow_quarter=self.use_quarterly,
+            need_balance_annual=True,
+            need_enterprise_value=True,
+            need_ratios_ttm=True,
+            need_key_metrics_ttm=True,
+        )
