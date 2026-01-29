@@ -1,12 +1,11 @@
 from openpyxl.styles import PatternFill, Font, Alignment
+import os
 
 CHECKLIST_FILE = "Fundamental_Checklist_v3_value_matrix_fixed.xlsx"
 
 # If True, always try Financial Modeling Prep (FMP) as a fallback when Yahoo/yfinance
 # data is missing or incomplete.
-FORCE_FMP_FALLBACK = True
-
-
+FORCE_FMP_FALLBACK = (os.environ.get("FORCE_FMP_FALLBACK","").strip().lower() in ("1","true","yes"))
 FILL_GREEN  = PatternFill("solid", fgColor="C6EFCE")
 FILL_YELLOW = PatternFill("solid", fgColor="FFEB9C")
 FILL_RED    = PatternFill("solid", fgColor="FFC7CE")

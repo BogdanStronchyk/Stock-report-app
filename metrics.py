@@ -468,6 +468,34 @@ def _history_retry(symbol: str, tkr: yf.Ticker, period: str, interval: str = "1d
         return h2
     return pd.DataFrame()
 
+
+# -------------------------------------------------------------------
+# History slicing helpers (PERF)
+# -------------------------------------------------------------------
+def _slice_history_from(hist: pd.DataFrame, years: float) -> pd.DataFrame:
+    """Slice a daily history df to last N years (no extra API calls)."""
+    if hist is None or hist.empty:
+        return pd.DataFrame()
+    try:
+        end = hist.index.max()
+        cutoff = end - pd.DateOffset(days=int(years * 365.25))
+        return hist.loc[hist.index >= cutoff].copy()
+    except Exception:
+        return hist
+
+
+def _slice_history_days(hist: pd.DataFrame, days: int) -> pd.DataFrame:
+    """Slice a daily history df to last N calendar days."""
+    if hist is None or hist.empty:
+        return pd.DataFrame()
+    try:
+        end = hist.index.max()
+        cutoff = end - pd.Timedelta(days=int(days))
+        return hist.loc[hist.index >= cutoff].copy()
+    except Exception:
+        return hist
+
+
 def twap(prices: pd.Series) -> Optional[float]:
     if prices is None or prices.empty:
         return None
@@ -689,11 +717,12 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
     industry = info.get("industry")
     sector_bucket = map_sector(sector, industry)
 
-    # Price histories (keep Adj Close column)
+    # Price histories
+    # PERF: one network call (10y) + local slicing instead of 4 separate calls.
     h10 = _history_retry(ticker, tkr, period="10y", interval="1d")
-    h5 = _history_retry(ticker, tkr, period="5y", interval="1d")
-    h1y = _history_retry(ticker, tkr, period="1y", interval="1d")
-    h3y = _history_retry(ticker, tkr, period="3y", interval="1d")
+    h5 = _slice_history_from(h10, 5.0)
+    h3y = _slice_history_from(h10, 3.0)
+    h1y = _slice_history_from(h10, 1.0)
 
     p10 = _adj_close(h10)
     p5 = _adj_close(h5)
@@ -994,18 +1023,17 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
         running_max = p3y.cummax()
         dd = (p3y / running_max - 1.0) * 100.0
         max_dd = float(dd.min())
-
     avg_dollar_vol = None
     try:
-        h3m = _history_retry(ticker, tkr, period="3mo", interval="1d")
-        if h3m is not None and not h3m.empty:
+        # PERF: reuse existing history slice (no extra Yahoo call)
+        h3m = _slice_history_days(h10, 110)  # ~3-4 months of calendar days
+        if h3m is not None and not h3m.empty and "Volume" in h3m.columns:
             px = _adj_close(h3m)
-            dv = (px * h3m["Volume"]).dropna()
+            dv = (px * pd.to_numeric(h3m["Volume"], errors="coerce")).dropna()
             if len(dv) > 10:
                 avg_dollar_vol = float(dv.mean())
     except Exception:
         pass
-
     worst_week_3y = worst_weekly_return_3y(h3y)
 
     # --- DAVF (Downside-Anchored Value Floor) ---
