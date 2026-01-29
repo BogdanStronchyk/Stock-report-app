@@ -424,16 +424,32 @@ def _weighted_score(items: Dict[str, Tuple[int, str]], weights: Dict[str, float]
     return 0.0 if wsum == 0 else (total / wsum) * 100.0
 
 
-def trend_reversal_scores(tkr: yf.Ticker, metrics: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    info = tkr.get_info()
 
-    q_income = tkr.quarterly_income_stmt
-    q_cf = tkr.quarterly_cashflow
-    annual_bs = tkr.balance_sheet
+def trend_reversal_scores_from_data(
+    *,
+    ticker: str,
+    info: Optional[Dict[str, Any]] = None,
+    q_income: Optional[pd.DataFrame] = None,
+    q_cf: Optional[pd.DataFrame] = None,
+    annual_bs: Optional[pd.DataFrame] = None,
+    h_1y: Optional[pd.DataFrame] = None,
+    h_2y: Optional[pd.DataFrame] = None,
+    metrics: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Compute reversal scores using *already-fetched* Yahoo data.
 
-    h_1y = tkr.history(period="1y", interval="1d", auto_adjust=False)
-    h_2y = tkr.history(period="2y", interval="1d", auto_adjust=False)
-
+    This avoids duplicate yfinance calls when metrics already loaded:
+      - info
+      - quarterly income + cashflow
+      - annual balance sheet
+      - price history (1y, 2y)
+    """
+    info = info or {}
+    q_income = q_income if q_income is not None else pd.DataFrame()
+    q_cf = q_cf if q_cf is not None else pd.DataFrame()
+    annual_bs = annual_bs if annual_bs is not None else pd.DataFrame()
+    h_1y = h_1y if h_1y is not None else pd.DataFrame()
+    h_2y = h_2y if h_2y is not None else pd.DataFrame()
     fundamental: Dict[str, Tuple[int, str]] = {}
     fundamental["Margin stabilization (TTM vs prior)"] = _fund_margin_stabilization(q_income)
     fundamental["Cashflow reversal (TTM FCF + quality)"] = _fund_cashflow_reversal(q_cf, q_income)
@@ -474,3 +490,23 @@ def trend_reversal_scores(tkr: yf.Ticker, metrics: Optional[Dict[str, Any]] = No
         "technical_score": t_score,
         "counts": counts,
     }
+
+
+def trend_reversal_scores(tkr: yf.Ticker, metrics: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Backwards-compatible wrapper (fetches Yahoo data via yfinance)."""
+    info = tkr.get_info() or {}
+    q_income = tkr.quarterly_income_stmt
+    q_cf = tkr.quarterly_cashflow
+    annual_bs = tkr.balance_sheet
+    h_1y = tkr.history(period="1y", interval="1d", auto_adjust=False)
+    h_2y = tkr.history(period="2y", interval="1d", auto_adjust=False)
+    return trend_reversal_scores_from_data(
+        ticker=getattr(tkr, "ticker", "") or "",
+        info=info,
+        q_income=q_income,
+        q_cf=q_cf,
+        annual_bs=annual_bs,
+        h_1y=h_1y,
+        h_2y=h_2y,
+        metrics=metrics,
+    )

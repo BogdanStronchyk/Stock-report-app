@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from cache_utils import DiskCache, yf_call, yf_cache_settings
+
 from config import FORCE_FMP_FALLBACK
 from value_matrix_extras import compute_value_matrix_extras
 
@@ -435,14 +437,14 @@ def _fast_info_dict(tkr: yf.Ticker) -> Dict[str, Any]:
 def _download_history(symbol: str, period: str, interval: str = "1d") -> pd.DataFrame:
     """Fallback history fetch using yf.download (sometimes more stable than Ticker.history)."""
     try:
-        return yf.download(
+        return yf_call(lambda: yf.download(
             symbol,
             period=period,
             interval=interval,
             auto_adjust=False,
             progress=False,
             threads=False,
-        )
+        ))
     except Exception:
         return pd.DataFrame()
 
@@ -452,7 +454,7 @@ def _history_retry(symbol: str, tkr: yf.Ticker, period: str, interval: str = "1d
     last_err = None
     for i in range(max(1, tries)):
         try:
-            h = tkr.history(period=period, interval=interval, auto_adjust=False)
+            h = yf_call(lambda: tkr.history(period=period, interval=interval, auto_adjust=False))
             if h is not None and not h.empty:
                 return h
         except Exception as e:
@@ -679,7 +681,13 @@ def normalize_cycle_proxy(current_price: float, ath: float) -> Optional[float]:
 # -------------------------------------------------------------------
 # Main metrics computation
 # -------------------------------------------------------------------
-def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, Any]:
+def compute_metrics_v2(
+    ticker: str,
+    use_fmp_fallback: bool = True,
+    *,
+    fmp_mode: str = "full",
+    use_yf_cache: Optional[bool] = None,
+) -> Dict[str, Any]:
     """Compute checklist metrics + improved compound Stock NUPL v2.
 
     Adds a special key '__notes__' which maps metric name -> note string.
@@ -687,7 +695,39 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
     'not meaningful' ratios are explicitly explained.
     """
     tkr = yf.Ticker(ticker)
-    info = tkr.get_info() or {}
+
+
+    # --- Yahoo cache + concurrency cap ---
+    _cache_enabled, _cache_ttl = yf_cache_settings()
+    if use_yf_cache is not None:
+        _cache_enabled = bool(use_yf_cache)
+    yf_cache = DiskCache("yf", ttl_hours=_cache_ttl, enabled=_cache_enabled)
+
+    def _cached_json(key: str, fn):
+        v = yf_cache.get_json(key)
+        if v is not None:
+            return v
+        try:
+            v2 = fn()
+        except Exception:
+            v2 = None
+        if v2 is not None:
+            yf_cache.set_json(key, v2)
+        return v2
+
+    def _cached_df(key: str, fn):
+        v = yf_cache.get_pickle(key)
+        if v is not None:
+            return v
+        try:
+            v2 = fn()
+        except Exception:
+            v2 = None
+        if v2 is not None:
+            yf_cache.set_pickle(key, v2)
+        return v2
+
+    info = _cached_json(f"info:{ticker}", lambda: yf_call(lambda: tkr.get_info() or {})) or {}
     fast_info = _fast_info_dict(tkr)
 
     notes: Dict[str, str] = {}
@@ -702,14 +742,18 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
     forced = bool(FORCE_FMP_FALLBACK)
     use_fmp_effective = requested or forced
 
+    env_mode = (os.environ.get("FMP_MODE") or "").strip().lower()
+    fmp_mode_effective = (env_mode or (fmp_mode or "full")).strip().lower()
+
     if not use_fmp_effective:
         notes["FMP"] = "enabled=no (disabled by user)"
     elif fmp.enabled:
-        fmp_data = fmp.fetch_all(ticker) or {}
+        # Partial FMP to control time/budget per stage (conditional|minimal|full)
+        fmp_data = fmp.fetch_bundle(ticker, mode=fmp_mode_effective) or {}
         if forced and not requested:
-            notes["FMP"] = f"enabled=yes (FORCED); requests={fmp.request_count}; last_status={fmp.last_status}; last_error={fmp.last_error}"
+            notes["FMP"] = f"enabled=yes (FORCED, mode={fmp_mode_effective}); requests={fmp.request_count}; last_status={fmp.last_status}; last_error={fmp.last_error}"
         else:
-            notes["FMP"] = f"enabled=yes; requests={fmp.request_count}; last_status={fmp.last_status}; last_error={fmp.last_error}"
+            notes["FMP"] = f"enabled=yes (mode={fmp_mode_effective}); requests={fmp.request_count}; last_status={fmp.last_status}; last_error={fmp.last_error}"
     else:
         notes["FMP"] = "enabled=no (set FMP_API_KEY env var to enable fallback)"
 
@@ -719,9 +763,12 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
 
     # Price histories
     # PERF: one network call (10y) + local slicing instead of 4 separate calls.
-    h10 = _history_retry(ticker, tkr, period="10y", interval="1d")
+    h10 = _cached_df(f"hist:{ticker}:10y:1d", lambda: _history_retry(ticker, tkr, period="10y", interval="1d"))
+    if h10 is None:
+        h10 = pd.DataFrame()
     h5 = _slice_history_from(h10, 5.0)
     h3y = _slice_history_from(h10, 3.0)
+    h2y = _slice_history_from(h10, 2.0)
     h1y = _slice_history_from(h10, 1.0)
 
     p10 = _adj_close(h10)
@@ -813,9 +860,15 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
     nupl_regime = stock_nupl_regime_from_z(composite_z)
 
     # --- Statements ---
-    annual_income = tkr.income_stmt
-    annual_bs = tkr.balance_sheet
-    annual_cf = tkr.cashflow
+    annual_income = _cached_df(f"stmt:{ticker}:income_stmt", lambda: yf_call(lambda: tkr.income_stmt))
+    if annual_income is None:
+        annual_income = pd.DataFrame()
+    annual_bs = _cached_df(f"stmt:{ticker}:balance_sheet", lambda: yf_call(lambda: tkr.balance_sheet))
+    if annual_bs is None:
+        annual_bs = pd.DataFrame()
+    annual_cf = _cached_df(f"stmt:{ticker}:cashflow", lambda: yf_call(lambda: tkr.cashflow))
+    if annual_cf is None:
+        annual_cf = pd.DataFrame()
 
     # Valuation basics (Yahoo → FMP fallback)
     trailing_pe = safe_get(info, "trailingPE")
@@ -839,8 +892,12 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
         mcap = _fmp_get_num(fmp_data, "quote", "marketCap")
 
     # TTM revenue & FCF
-    q_income = tkr.quarterly_income_stmt
-    q_cf = tkr.quarterly_cashflow
+    q_income = _cached_df(f"stmt:{ticker}:q_income", lambda: yf_call(lambda: tkr.quarterly_income_stmt))
+    if q_income is None:
+        q_income = pd.DataFrame()
+    q_cf = _cached_df(f"stmt:{ticker}:q_cf", lambda: yf_call(lambda: tkr.quarterly_cashflow))
+    if q_cf is None:
+        q_cf = pd.DataFrame()
 
     ttm_rev = last_n_quarters_sum(q_income, ["Total Revenue", "TotalRevenue"], n=4)
 
@@ -1159,6 +1216,18 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True) -> Dict[str, 
     # Merge extras last so they can overwrite base placeholders (e.g., previously-NA checklist metrics).
     if extra_metrics:
         metrics.update(extra_metrics)
+
+
+    # --- Bundle Yahoo objects so reversal scoring can reuse them without extra calls ---
+    metrics["__yf_bundle__"] = {
+        "info": info,
+        "q_income": q_income,
+        "q_cf": q_cf,
+        "annual_bs": annual_bs,
+        "h10": h10,
+        "h1y": h1y,
+        "h2y": h2y,
+    }
 
     metrics["__notes__"] = notes
     return metrics
