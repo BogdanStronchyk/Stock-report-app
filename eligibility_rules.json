@@ -1,0 +1,55 @@
+{
+    "strict": {
+        "description": "High conviction candidates. (Equivalent to old 'Buy' mode)",
+        "min_overall_coverage": 70.0,
+        "min_category_coverage": {
+            "Valuation": 55.0,
+            "Profitability": 55.0,
+            "Balance Sheet": 55.0,
+            "Risk": 45.0
+        },
+        "min_category_score": {
+            "Balance Sheet": 15.0,
+            "Risk": 15.0
+        },
+        "min_total_scores": {
+            "fund_adj": 60.0,
+            "reversal_total": 55.0
+        },
+        "davf_policy": "enforce_allowed",
+        "davf_list": ["GREEN", "YELLOW"]
+    },
+
+    "permissible": {
+        "description": "Standard screening. (Equivalent to old 'Shortlist' mode)",
+        "min_overall_coverage": 60.0,
+        "min_category_coverage": {
+            "Valuation": 45.0,
+            "Profitability": 45.0,
+            "Balance Sheet": 45.0,
+            "Risk": 35.0
+        },
+        "min_category_score": {
+            "Balance Sheet": 10.0,
+            "Risk": 10.0
+        },
+        "min_total_scores": {},
+        "davf_policy": "flag_watch",
+        "davf_list": ["NA", "RED"]
+    },
+
+    "loose": {
+        "description": "Wide funnel. Very forgiving on data gaps.",
+        "min_overall_coverage": 40.0,
+        "min_category_coverage": {
+            "Valuation": 20.0,
+            "Profitability": 20.0,
+            "Balance Sheet": 20.0,
+            "Risk": 0.0
+        },
+        "min_category_score": {},
+        "min_total_scores": {},
+        "davf_policy": "ignore",
+        "davf_list": []
+    }
+}

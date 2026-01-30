@@ -1,29 +1,39 @@
-"""Eligibility gating for index-scale screening.
+"""
+eligibility.py
 
-This module adds a *decision eligibility layer* on top of your existing:
-- per-metric ratings (GREEN/YELLOW/RED/NA)
-- category adjusted scores (already coverage-adjusted)
-- sector buckets (already checklist-sector aware)
-- DAVF downside protection
-- reversal confirmation
-
-Why this exists:
-Coverage-adjusted scores reduce inflation, but they do not *prevent* a ticker with
-thin critical coverage from ranking highly in a large universe. Eligibility
-gates enforce "fail-closed" behavior for automated screening.
-
-You can tune thresholds in DEFAULT_RULES below without changing other code.
+Data-driven eligibility gating.
+Loads rules from 'eligibility_rules.json' to determine PASS/WATCH/FAIL status.
 """
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Any
 
+# Map legacy internal mode names to new JSON keys
+MODE_ALIASES = {
+    "buy": "strict",
+    "portfolio": "strict",
+    "shortlist": "permissible",
+    "screen": "permissible",
+    "broad": "loose",
+}
+
+DEFAULT_RULES_FILE = "eligibility_rules.json"
+
+# Fallback in case JSON is missing
+FALLBACK_RULES = {
+    "strict": {
+        "min_overall_coverage": 70.0,
+        "davf_policy": "enforce_allowed",
+        "davf_list": ["GREEN", "YELLOW"]
+    }
+}
 
 @dataclass(frozen=True)
 class EligibilityResult:
-    """Eligibility decision for screening/shortlisting."""
     status: str          # PASS | WATCH | FAIL
     label: str           # ELIGIBLE | WATCH | INELIGIBLE
     overall_coverage_pct: float
@@ -37,92 +47,32 @@ class EligibilityResult:
         return " | ".join(items) + suffix
 
 
-# ---- Tunable rules ----
-DEFAULT_RULES = {
-    # For continuous screening: keep the funnel wide, but fail-closed on thin *core* coverage.
-    "shortlist": {
-        "min_overall_cov": 60.0,
-        "min_cat_cov": {
-            "Valuation": 45.0,
-            "Profitability": 45.0,
-            "Balance Sheet": 45.0,
-            "Risk": 35.0,
-        },
-        # Structural red flags: if the model can score them and they're terrible, do not shortlist.
-        "min_cat_adj": {
-            "Balance Sheet": 15.0,
-            "Risk": 15.0,
-        },
-        # DAVF: allow, but degrade to WATCH if uncertain/no protection.
-        "davf_watch": {"NA", "RED"},
-    },
-
-    # For a stricter "buy candidate" filter: narrower funnel.
-    "buy": {
-        "min_overall_cov": 70.0,
-        "min_cat_cov": {
-            "Valuation": 55.0,
-            "Profitability": 55.0,
-            "Balance Sheet": 55.0,
-            "Risk": 45.0,
-        },
-        "min_scores": {
-            "fund_adj": 60.0,
-            "reversal_total": 55.0,
-        },
-        "davf_allowed": {"GREEN", "YELLOW"},
-    },
-}
+def _load_rules() -> Dict[str, Any]:
+    """Load JSON rules from disk or return fallback."""
+    path = os.path.join(os.getcwd(), DEFAULT_RULES_FILE)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading {DEFAULT_RULES_FILE}: {e}")
+    return FALLBACK_RULES
 
 
+# Cache rules in memory so we don't re-read file for every ticker
+_CACHED_RULES = {}
 
-# Keep in sync with scoring.CATEGORY_WEIGHTS (duplicated here to avoid import cycles).
-CATEGORY_WEIGHTS = {
-    "Valuation": 0.20,
-    "Profitability": 0.25,
-    "Balance Sheet": 0.25,
-    "Growth": 0.15,
-    "Risk": 0.15,
-}
+def get_rule_set(mode: str) -> Dict[str, Any]:
+    global _CACHED_RULES
+    if not _CACHED_RULES:
+        _CACHED_RULES = _load_rules()
 
-# ---- Optional sector anchor checks (non-breaking) ----
-# These only activate when a matching anchor metric exists in the checklist for that ticker.
-SECTOR_ANCHORS = {
-    # Typical bank/financial anchor concepts.
-    "FINANCIALS": {
-        "Valuation": ["P/B", "PRICE/BOOK", "P/TBV", "TANGIBLE BOOK"],
-        "Profitability": ["ROE", "NET INTEREST", "NIM"],
-    }
-}
+    # Resolve alias (e.g. 'buy' -> 'strict')
+    clean_mode = mode.strip().lower()
+    target_key = MODE_ALIASES.get(clean_mode, clean_mode)
 
-
-def _norm_sector_bucket(sector_bucket: Optional[str]) -> str:
-    s = (sector_bucket or "").upper()
-    if "FINANCIAL" in s or "BANK" in s:
-        return "FINANCIALS"
-    return ""
-
-
-def _anchor_missing(
-    sector_key: str,
-    category: str,
-    category_ratings: Dict[str, str],
-) -> bool:
-    patterns = SECTOR_ANCHORS.get(sector_key, {}).get(category, [])
-    if not patterns:
-        return False
-
-    # Only enforce if the checklist *contains* at least one anchor.
-    present = []
-    scorable = []
-    for metric, rating in (category_ratings or {}).items():
-        m = (metric or "").upper()
-        if any(p in m for p in patterns):
-            present.append(metric)
-            if (rating or "NA").upper() != "NA":
-                scorable.append(metric)
-
-    return bool(present) and not bool(scorable)
+    # Return rules or strict fallback if key missing
+    return _CACHED_RULES.get(target_key) or _CACHED_RULES.get("strict") or FALLBACK_RULES["strict"]
 
 
 def evaluate_eligibility(
@@ -130,119 +80,93 @@ def evaluate_eligibility(
     mode: str,
     cat_adj: Dict[str, Optional[float]],
     cat_cov: Dict[str, float],
-    category_ratings: Dict[str, Dict[str, str]],
+    category_ratings: Dict[str, Dict[str, str]],  # Unused by generic logic but kept for interface compat
     sector_bucket: Optional[str] = None,
     fund_adj: Optional[float] = None,
     reversal_total: Optional[float] = None,
     davf_label: Optional[str] = None,
 ) -> EligibilityResult:
-    """Return an EligibilityResult for the given ticker.
 
-    - mode: "shortlist" (default screener) or "buy" (strict candidate filter)
-    - cat_adj: adjusted category scores (0-100) or None
-    - cat_cov: category coverage % (0-100)
-    - category_ratings: {category -> {metric -> rating}}
-    """
-    rules = DEFAULT_RULES.get(mode) or DEFAULT_RULES["shortlist"]
+    rules = get_rule_set(mode)
+    reasons: List[str] = []
 
+    # --- Helper to safely get floats ---
     def _f(x) -> Optional[float]:
         try:
             return None if x is None else float(x)
         except Exception:
             return None
 
-    # Weighted overall coverage by category importance.
-    # Uses CATEGORY_WEIGHTS where available; falls back to equal-weight if not.
-    total_w = 0.0
-    weighted = 0.0
-    for cat, cov in (cat_cov or {}).items():
-        try:
-            c = float(cov or 0.0)
-        except Exception:
-            c = 0.0
-        w = float(CATEGORY_WEIGHTS.get(cat, 0.0) or 0.0)
-        if w <= 0:
-            # If a category isn't recognized, treat it with a small equal weight later.
-            continue
-        weighted += c * w
-        total_w += w
+    # --- 1. Calculate Overall Coverage ---
+    # (Simple average of category coverages if explicit weights unavailable)
+    cov_vals = [float(v) for v in (cat_cov or {}).values() if v is not None]
+    overall_cov = sum(cov_vals) / max(1, len(cov_vals)) if cov_vals else 0.0
 
-    if total_w > 0:
-        overall_cov = weighted / total_w
-    else:
-        cov_vals = [float(v) for v in (cat_cov or {}).values() if v is not None]
-        overall_cov = sum(cov_vals) / len(cov_vals) if cov_vals else 0.0
+    # --- 2. Check Coverage Gates ---
+    min_cov = float(rules.get("min_overall_coverage", 0.0))
+    if overall_cov < min_cov:
+        reasons.append(f"Low overall coverage ({overall_cov:.0f}% < {min_cov:.0f}%)")
 
-    reasons: List[str] = []
+    for cat, limit in rules.get("min_category_coverage", {}).items():
+        curr = float(cat_cov.get(cat, 0.0))
+        if curr < float(limit):
+            reasons.append(f"Thin {cat} data ({curr:.0f}% < {limit:.0f}%)")
 
-    # Overall coverage gate
-    if overall_cov < float(rules.get("min_overall_cov", 0.0)):
-        reasons.append(f"Low overall scorable coverage ({overall_cov:.0f}%)")
+    # --- 3. Check Score Gates (Fundamental & Reversal) ---
+    for score_key, limit in rules.get("min_total_scores", {}).items():
+        val = None
+        if score_key == "fund_adj": val = _f(fund_adj)
+        elif score_key == "reversal_total": val = _f(reversal_total)
 
-    # Category coverage gates
-    for cat, thr in (rules.get("min_cat_cov") or {}).items():
-        cov = float(cat_cov.get(cat, 0.0) or 0.0)
-        if cov < float(thr):
-            reasons.append(f"{cat} coverage {cov:.0f}% < {float(thr):.0f}%")
+        if val is not None and val < float(limit):
+            reasons.append(f"{score_key} too low ({val:.0f} < {limit})")
 
-    # Category structural red flag gates (only if score exists)
-    for cat, thr in (rules.get("min_cat_adj") or {}).items():
-        s = _f(cat_adj.get(cat))
-        if s is not None and s < float(thr):
-            reasons.append(f"{cat} adjusted score {s:.0f}% < {float(thr):.0f}%")
+    # --- 4. Check Structural Category Scores ---
+    # e.g., Reject if Balance Sheet score is < 15
+    for cat, limit in rules.get("min_category_score", {}).items():
+        val = _f(cat_adj.get(cat))
+        if val is not None and val < float(limit):
+            reasons.append(f"Weak {cat} structure ({val:.0f} < {limit})")
 
-    # DAVF handling
-    d = (davf_label or "NA").upper().strip()
-    if mode == "buy":
-        allowed = set(rules.get("davf_allowed") or set())
-        if allowed and d not in allowed:
-            reasons.append(f"DAVF not acceptable for buy (DAVF={d})")
-    else:
-        watch = set(rules.get("davf_watch") or set())
-        if d in watch:
-            reasons.append(f"DAVF weak/uncertain (DAVF={d})")
+    # --- 5. DAVF (Downside Protection) Logic ---
+    davf = (davf_label or "NA").upper().strip()
+    policy = rules.get("davf_policy", "ignore")
+    davf_list = set(rules.get("davf_list", []))
 
-    # Buy-mode minimum score gates
-    if mode == "buy":
-        mins = rules.get("min_scores") or {}
-        fmin = float(mins.get("fund_adj", 0.0))
-        rmin = float(mins.get("reversal_total", 0.0))
+    if policy == "enforce_allowed":
+        # Strict: Must be in the allowed list (e.g. GREEN/YELLOW)
+        if davf not in davf_list:
+            reasons.append(f"DAVF protection insufficient ({davf})")
 
-        f = _f(fund_adj)
-        r = _f(reversal_total)
+    elif policy == "flag_watch":
+        # Permissible: If in list (e.g. RED/NA), flag it but don't auto-fail yet
+        if davf in davf_list:
+            reasons.append(f"DAVF weak ({davf})")
 
-        if f is not None and f < fmin:
-            reasons.append(f"Fund checklist {f:.0f}% < {fmin:.0f}%")
-        if r is not None and r < rmin:
-            reasons.append(f"Reversal {r:.0f}% < {rmin:.0f}%")
-
-    # Optional sector anchors (only when anchors exist in the checklist)
-    sector_key = _norm_sector_bucket(sector_bucket)
-    if sector_key:
-        for cat in ("Valuation", "Profitability"):
-            if _anchor_missing(sector_key, cat, (category_ratings or {}).get(cat, {}) or {}):
-                reasons.append(f"{cat}: missing sector anchor metric for {sector_key}")
-
-    # Decide PASS/WATCH/FAIL
+    # --- Final Decision ---
     if not reasons:
-        return EligibilityResult(status="PASS", label="ELIGIBLE", overall_coverage_pct=float(overall_cov), reasons=[])
+        return EligibilityResult(status="PASS", label="ELIGIBLE", overall_coverage_pct=overall_cov, reasons=[])
 
-    # Fail vs watch:
-    # - If overall coverage is low OR a core category coverage fails -> FAIL
-    # - Otherwise -> WATCH
-    core_fail = False
-    if overall_cov < float(rules.get("min_overall_cov", 0.0)):
-        core_fail = True
-    for cat, thr in (rules.get("min_cat_cov") or {}).items():
-        cov = float(cat_cov.get(cat, 0.0) or 0.0)
-        if cov < float(thr):
-            core_fail = True
+    # Determining FAIL vs WATCH
+    # If policy is strict, any reason is a FAIL.
+    # If policy is permissible, we might allow 'watch' for soft failures.
 
-    if mode == "buy":
-        # For buy candidates, any reason is a FAIL.
-        core_fail = True
+    # We treat Coverage failures as hard FAILS usually,
+    # but Score failures might be WATCH in looser modes.
+    # For simplicity/safety:
+    # Strict mode -> Fail closed (FAIL)
+    # Permissible -> Fail closed on Coverage, Watch on Scores?
 
-    if core_fail:
-        return EligibilityResult(status="FAIL", label="INELIGIBLE", overall_coverage_pct=float(overall_cov), reasons=reasons)
+    # Implementation: If mode is Strict ('buy'), everything is a FAIL.
+    if mode in ("strict", "buy", "portfolio"):
+        return EligibilityResult(status="FAIL", label="INELIGIBLE", overall_coverage_pct=overall_cov, reasons=reasons)
 
-    return EligibilityResult(status="WATCH", label="WATCH", overall_coverage_pct=float(overall_cov), reasons=reasons)
+    # In Permissible/Loose:
+    # If coverage is the issue -> FAIL (bad data)
+    # If score is the issue -> WATCH (bad stock, but readable)
+    is_coverage_issue = any("coverage" in r.lower() or "data" in r.lower() for r in reasons)
+
+    if is_coverage_issue:
+        return EligibilityResult(status="FAIL", label="INELIGIBLE", overall_coverage_pct=overall_cov, reasons=reasons)
+
+    return EligibilityResult(status="WATCH", label="WATCH", overall_coverage_pct=overall_cov, reasons=reasons)

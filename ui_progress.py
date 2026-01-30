@@ -4,65 +4,102 @@ from tkinter import ttk, messagebox
 
 
 class ProgressWindow:
-    """Small always-on-top progress window for report generation."""
+    """
+    Modern progress window to visualize the Portfolio Candidate generation stages.
+    """
 
-    def __init__(self, total_steps: int, title: str = "Generating report..."):
+    def __init__(self, total_steps: int, title: str = "Processing..."):
         self.total_steps = max(1, int(total_steps))
         self.current = 0
 
         self.root = tk.Tk()
         self.root.title(title)
-        self.root.geometry("520x178")
+        self.root.geometry("500x220")
         self.root.resizable(False, False)
 
+        # Keep on top
         try:
             self.root.attributes("-topmost", True)
         except Exception:
             pass
 
-        self.label = tk.Label(self.root, text="Starting...", font=("Segoe UI", 10, "bold"))
-        self.label.pack(pady=(18, 10))
+        # -- Main Container --
+        main_frame = tk.Frame(self.root, padx=20, pady=20)
+        main_frame.pack(fill="both", expand=True)
 
-        self.pb = ttk.Progressbar(self.root, orient="horizontal", length=460, mode="determinate")
-        self.pb.pack(pady=6)
+        # -- Header --
+        self.lbl_main = tk.Label(
+            main_frame,
+            text="Initializing...",
+            font=("Segoe UI", 11, "bold"),
+            wraplength=460,
+            justify="center"
+        )
+        self.lbl_main.pack(pady=(0, 10))
+
+        # -- Progress Bar --
+        self.style = ttk.Style()
+        self.style.theme_use('default')
+        self.style.configure("green.Horizontal.TProgressbar", background='#4caf50')
+
+        self.pb = ttk.Progressbar(
+            main_frame,
+            orient="horizontal",
+            length=460,
+            mode="determinate",
+            style="green.Horizontal.TProgressbar"
+        )
+        self.pb.pack(pady=5)
         self.pb["maximum"] = self.total_steps
         self.pb["value"] = 0
 
-        self.sub = tk.Label(self.root, text="", font=("Segoe UI", 9))
-        self.sub.pack(pady=(6, 0))
+        # -- Percentage Label --
+        self.lbl_pct = tk.Label(main_frame, text="0%", font=("Segoe UI", 9), fg="#666")
+        self.lbl_pct.pack(pady=(2, 10))
 
-        # Rolling progress stats line (e.g., per-ticker timing)
-        self.done = tk.Label(self.root, text="", font=("Segoe UI", 9), fg="#555555")
-        self.done.pack(pady=(4, 0))
+        # -- Detail Lines --
+        self.lbl_sub = tk.Label(
+            main_frame,
+            text="Waiting for workers...",
+            font=("Segoe UI", 9),
+            fg="#333"
+        )
+        self.lbl_sub.pack(pady=(0, 2))
 
-        self.root.update_idletasks()
+        self.lbl_done = tk.Label(
+            main_frame,
+            text="",
+            font=("Segoe UI", 8),
+            fg="#777"
+        )
+        self.lbl_done.pack(pady=(5, 0))
+
         self.root.update()
 
     def set_status(self, main_text: str, sub_text: str = ""):
-        """Update text without advancing the progress bar."""
-        self.label.config(text=main_text)
-        self.sub.config(text=sub_text)
-        self.root.update_idletasks()
-        self.root.update()
-
-    def set_done(self, text: str = ""):
-        self.done.config(text=text)
-        self.root.update_idletasks()
+        """Update text headers without moving the bar."""
+        self.lbl_main.config(text=main_text)
+        self.lbl_sub.config(text=sub_text)
         self.root.update()
 
     def step(self, main_text: str = None, sub_text: str = "", done_text: str = None):
-        """Advance the progress bar by 1 step and update labels."""
+        """Advance progress and update status labels."""
         self.current = min(self.total_steps, self.current + 1)
         self.pb["value"] = self.current
 
-        if main_text is not None:
-            self.label.config(text=main_text)
-        self.sub.config(text=sub_text)
+        # Calculate percentage
+        pct = int((self.current / self.total_steps) * 100)
+        self.lbl_pct.config(text=f"{pct}%")
 
-        if done_text is not None:
-            self.done.config(text=done_text)
+        if main_text:
+            self.lbl_main.config(text=main_text)
 
-        self.root.update_idletasks()
+        if sub_text:
+            self.lbl_sub.config(text=sub_text)
+
+        if done_text:
+            self.lbl_done.config(text=done_text)
+
         self.root.update()
 
     def close(self):
@@ -72,9 +109,12 @@ class ProgressWindow:
             pass
 
 
-def success_popup(filepath: str):
-    """Shows a success popup and offers to open the folder (Windows)."""
-    folder = os.path.dirname(os.path.abspath(filepath))
+def success_popup(message: str):
+    """
+    Shows a success popup. If message is a path, offers to open folder.
+    """
+    is_path = os.path.exists(message) or os.path.isabs(message)
+
     root = tk.Tk()
     root.withdraw()
     try:
@@ -82,13 +122,18 @@ def success_popup(filepath: str):
     except Exception:
         pass
 
-    msg = f"Report saved successfully!\n\n{filepath}\n\nOpen containing folder?"
-    open_it = messagebox.askyesno("✅ Report generated", msg)
-
-    if open_it:
-        try:
-            os.startfile(folder)  # Windows only
-        except Exception:
-            messagebox.showinfo("Folder path", folder)
+    if is_path:
+        # It's a file path
+        folder = os.path.dirname(os.path.abspath(message))
+        msg_body = f"Report generated successfully!\n\nSaved to:\n{message}\n\nOpen containing folder?"
+        open_it = messagebox.askyesno("Process Complete", msg_body)
+        if open_it:
+            try:
+                os.startfile(folder)
+            except Exception:
+                messagebox.showinfo("Folder", folder)
+    else:
+        # It's just a message
+        messagebox.showinfo("Process Complete", message)
 
     root.destroy()

@@ -1,10 +1,10 @@
 import os
 import glob
 import tkinter as tk
+from tkinter import messagebox, ttk
+from typing import Optional, Dict, Any
 
 from config import FORCE_FMP_FALLBACK
-from tkinter import messagebox
-from typing import Optional, Dict, Any
 
 
 def _discover_universe_csvs() -> Dict[str, str]:
@@ -15,9 +15,10 @@ def _discover_universe_csvs() -> Dict[str, str]:
     candidates: Dict[str, str] = {}
 
     # 1) ./universes/*.csv
-    for p in glob.glob(os.path.join(os.getcwd(), "universes", "*.csv")):
-        name = os.path.splitext(os.path.basename(p))[0]
-        candidates[name.upper()] = p
+    if os.path.exists(os.path.join(os.getcwd(), "universes")):
+        for p in glob.glob(os.path.join(os.getcwd(), "universes", "*.csv")):
+            name = os.path.splitext(os.path.basename(p))[0]
+            candidates[name.upper()] = p
 
     # 2) project root *.csv (for quick drop-in)
     for p in glob.glob(os.path.join(os.getcwd(), "*.csv")):
@@ -25,166 +26,180 @@ def _discover_universe_csvs() -> Dict[str, str]:
         # only keep known-ish names to avoid picking random CSVs
         if name.lower() in {
             "sp500", "nasdaq100", "dow30", "russell1000",
-            "ftse100", "dax40", "nikkei225", "stoxx600"
+            "ftse100", "dax40", "nikkei225", "stoxx600", "universe"
         }:
             candidates[name.upper()] = p
 
-    # Stable ordering (UI dropdown)
-    ordered = {}
-    for key in sorted(candidates.keys()):
-        ordered[key] = candidates[key]
-    return ordered
+    # Stable ordering
+    return dict(sorted(candidates.items()))
 
 
 def ask_stocks(default_text: str = "") -> Optional[Dict[str, Any]]:
-    """UI to choose either manual tickers or an index universe.
+    """UI to choose manual tickers or multiple index universes.
 
     Returns a dict or None if canceled.
       {
         'mode': 'manual' | 'universe',
         'raw': 'AAPL,MSFT' (manual mode only),
-        'universe_name': 'SP500' (universe mode only),
-        'universe_path': '/path/to/sp500.csv' (universe mode only),
-        'analysis_stage': 'portfolio' | 'shortlist' | 'broad',
-        'use_fmp': bool
+        'universe_paths': ['/path/to/sp500.csv', ...],
+        'use_fmp': bool,
+        'eligibility_mode': 'strict' | 'permissible' | 'loose'
       }
     """
     result: Dict[str, Any] = {
         "mode": "manual",
         "raw": None,
-        "universe_name": None,
-        "universe_path": None,
-        "analysis_stage": None,
-        "use_fmp": True,
+        "universe_paths": [],
+        "use_fmp": False,
+        "eligibility_mode": "strict"
     }
 
-    # Default: enable FMP only if an API key is present.
-    # If FORCE_FMP_FALLBACK=True, the checkbox is locked ON when a key exists.
+    # FMP Toggle Logic
     has_fmp_key = bool(os.environ.get("FMP_API_KEY", "").strip())
     forced = bool(FORCE_FMP_FALLBACK) and has_fmp_key
     result["use_fmp"] = has_fmp_key
 
     universes = _discover_universe_csvs()
-    universe_names = list(universes.keys()) or ["(no CSVs found)"]
 
     root = tk.Tk()
-    root.title("Stock Report App — Pick Universe / Stocks")
-    root.geometry("640x380")
-    root.resizable(False, False)
+    root.title("Stock Report App — Portfolio Generator")
+
+    # --- CHANGE: Increased Height for better button visibility ---
+    root.geometry("680x750")
+    root.resizable(True, True)
 
     try:
         root.attributes("-topmost", True)
     except Exception:
         pass
 
-    title = tk.Label(root, text="Choose a mode", font=("Segoe UI", 11, "bold"))
-    title.pack(pady=(14, 6))
+    # -- Header --
+    title = tk.Label(root, text="Portfolio Candidates Generator", font=("Segoe UI", 14, "bold"))
+    title.pack(pady=(15, 5))
 
     mode_var = tk.StringVar(value="manual")
 
+    # -- Mode Selection --
     mode_frame = tk.Frame(root)
-    mode_frame.pack(pady=(0, 8))
+    mode_frame.pack(pady=(0, 10))
 
-    rb_manual = tk.Radiobutton(mode_frame, text="Manual tickers / company names", variable=mode_var, value="manual")
-    rb_univ = tk.Radiobutton(mode_frame, text="Index universe (CSV)", variable=mode_var, value="universe")
-    rb_manual.pack(side="left", padx=12)
-    rb_univ.pack(side="left", padx=12)
+    rb_manual = tk.Radiobutton(mode_frame, text="Manual Tickers", variable=mode_var, value="manual",
+                               font=("Segoe UI", 10))
+    rb_univ = tk.Radiobutton(mode_frame, text="Select Universes (CSV)", variable=mode_var, value="universe",
+                             font=("Segoe UI", 10))
+    rb_manual.pack(side="left", padx=15)
+    rb_univ.pack(side="left", padx=15)
 
-    # Manual entry
+    # -- Manual Entry Section --
     man_frame = tk.Frame(root)
-    man_frame.pack(fill="x", padx=16)
+    man_frame.pack(fill="x", padx=20, pady=5)
 
     hint = tk.Label(
         man_frame,
-        text="Comma separated • Case-insensitive • Dots allowed (e.g. ABC.DE)",
+        text="Enter tickers separated by commas (e.g. AAPL, MSFT, GOOG):",
         font=("Segoe UI", 9)
     )
-    hint.pack(anchor="w", pady=(0, 6))
+    hint.pack(anchor="w", pady=(0, 5))
 
-    entry = tk.Text(man_frame, height=4, font=("Consolas", 11))
+    entry = tk.Text(man_frame, height=3, font=("Consolas", 11))
     entry.pack(fill="x")
     if default_text:
         entry.insert("1.0", default_text)
 
-    # Universe picker
-    univ_frame = tk.Frame(root)
-    univ_frame.pack(fill="x", padx=16, pady=(10, 0))
+    # -- Universe Selection Section (Scrollable Checkboxes) --
+    univ_frame = tk.LabelFrame(root, text="Available Universes", padx=10, pady=10)
+    univ_frame.pack(fill="both", expand=True, padx=20, pady=10)
 
-    univ_label = tk.Label(univ_frame, text="Universe CSV:", font=("Segoe UI", 9))
-    univ_label.grid(row=0, column=0, sticky="w")
+    # Canvas + Scrollbar for list of checkboxes
+    canvas = tk.Canvas(univ_frame)
+    scrollbar = ttk.Scrollbar(univ_frame, orient="vertical", command=canvas.yview)
+    scrollable_frame = tk.Frame(canvas)
 
-    univ_var = tk.StringVar(value=universe_names[0])
-    univ_menu = tk.OptionMenu(univ_frame, univ_var, *universe_names)
-    univ_menu.config(width=24)
-    univ_menu.grid(row=0, column=1, sticky="w", padx=(8, 0))
-
-    univ_hint = tk.Label(
-        univ_frame,
-        text="Place CSVs in ./universes/ or project root (sp500.csv, nasdaq100.csv, ...).",
-        font=("Segoe UI", 8)
+    scrollable_frame.bind(
+        "<Configure>",
+        lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
     )
-    univ_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-    # Stage selector (affects speed + FMP usage)
-    stage_frame = tk.Frame(root)
-    stage_frame.pack(fill="x", padx=16, pady=(12, 0))
+    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
 
-    stage_label = tk.Label(stage_frame, text="Run mode:", font=("Segoe UI", 9))
-    stage_label.pack(anchor="w")
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
 
-    stage_var = tk.StringVar(value=(os.environ.get("ANALYSIS_STAGE", "portfolio") or "portfolio").strip().lower())
-    # normalize
-    if stage_var.get() not in ("broad", "scan", "wide", "shortlist", "narrow", "screen", "portfolio", "full"):
-        stage_var.set("portfolio")
+    # Populate checkboxes
+    univ_vars = {}
+    if not universes:
+        tk.Label(scrollable_frame, text="No CSV files found in ./universes/", fg="red").pack(anchor="w")
+    else:
+        for name, path in universes.items():
+            var = tk.BooleanVar()
+            chk = tk.Checkbutton(scrollable_frame, text=name, variable=var, font=("Segoe UI", 10))
+            chk.pack(anchor="w", pady=2)
+            univ_vars[path] = var
 
-    stage_row = tk.Frame(stage_frame)
-    stage_row.pack(anchor="w", pady=(4, 0))
+    # -- Filtering Strategy (NEW) --
+    strat_frame = tk.LabelFrame(root, text="Filtering Strategy", padx=15, pady=10)
+    strat_frame.pack(fill="x", padx=20, pady=(5, 10))
 
-    tk.Radiobutton(stage_row, text="Broad scan (fast, no statements)", variable=stage_var, value="broad").pack(side="left", padx=(0, 10))
-    tk.Radiobutton(stage_row, text="Shortlist screen (minimal FMP)", variable=stage_var, value="shortlist").pack(side="left", padx=(0, 10))
-    tk.Radiobutton(stage_row, text="Portfolio deep dive (full)", variable=stage_var, value="portfolio").pack(side="left")
+    rule_var = tk.StringVar(value="strict")
 
-    # FMP toggle
+    r_strict = tk.Radiobutton(strat_frame, text="Strict (Portfolio Candidates)", variable=rule_var, value="strict",
+                              font=("Segoe UI", 9, "bold"))
+    r_perm = tk.Radiobutton(strat_frame, text="Standard (Watchlist)", variable=rule_var, value="permissible",
+                            font=("Segoe UI", 9))
+    r_loose = tk.Radiobutton(strat_frame, text="Loose (Broad Scan)", variable=rule_var, value="loose",
+                             font=("Segoe UI", 9))
+
+    r_strict.pack(side="left", padx=(0, 20))
+    r_perm.pack(side="left", padx=(0, 20))
+    r_loose.pack(side="left")
+
+    # -- FMP Toggle --
+    fmp_frame = tk.Frame(root)
+    fmp_frame.pack(pady=(0, 10))
+
     use_fmp_var = tk.BooleanVar(value=result["use_fmp"])
-    label = "Use FMP fallback (requires FMP_API_KEY)"
+    fmp_label = "Enable FMP Data Fallback"
     if forced:
-        label = "Use FMP fallback (FORCED ON — FMP_API_KEY detected)"
+        fmp_label += " (Locked: FORCE_FMP_FALLBACK=1)"
+    elif not has_fmp_key:
+        fmp_label += " (Requires FMP_API_KEY)"
 
-    chk = tk.Checkbutton(root, text=label, variable=use_fmp_var)
+    chk_fmp = tk.Checkbutton(fmp_frame, text=fmp_label, variable=use_fmp_var, font=("Segoe UI", 9))
     if forced:
-        chk.configure(state="disabled")
+        chk_fmp.configure(state="disabled")
         use_fmp_var.set(True)
-    chk.pack(pady=(10, 0))
+    chk_fmp.pack()
 
+    # -- Logic --
     def _apply_mode_ui():
         is_univ = (mode_var.get() == "universe")
-        # Enable/disable manual entry and universe dropdown
         entry.configure(state=("disabled" if is_univ else "normal"))
-        univ_menu.configure(state=("normal" if is_univ else "disabled"))
+        entry.configure(bg=("#f0f0f0" if is_univ else "#ffffff"))
+
+        if is_univ:
+            univ_frame.configure(fg="black", text="Available Universes (Select at least one)")
+        else:
+            univ_frame.configure(fg="gray", text="Available Universes (Disabled)")
 
     def on_generate():
         mode = mode_var.get()
         result["mode"] = mode
-        result["analysis_stage"] = (stage_var.get() or "").strip().lower()
         result["use_fmp"] = bool(use_fmp_var.get())
+        result["eligibility_mode"] = rule_var.get()
 
         if mode == "manual":
             raw = entry.get("1.0", "end").strip()
             if not raw:
-                messagebox.showwarning("Missing input", "Please enter at least one ticker or company name.")
+                messagebox.showwarning("Input Required", "Please enter at least one ticker.")
                 return
             result["raw"] = raw
         else:
-            name = univ_var.get()
-            if name.startswith("("):
-                messagebox.showwarning("Missing universes", "No universe CSVs were found. Put CSVs into ./universes/ or project root.")
+            selected_paths = [path for path, var in univ_vars.items() if var.get()]
+            if not selected_paths:
+                messagebox.showwarning("Selection Required", "Please select at least one universe CSV.")
                 return
-            path = universes.get(name)
-            if not path or not os.path.exists(path):
-                messagebox.showwarning("Universe missing", f"Could not find CSV file for: {name}")
-                return
-            result["universe_name"] = name
-            result["universe_path"] = path
+            result["universe_paths"] = selected_paths
 
         root.destroy()
 
@@ -192,14 +207,16 @@ def ask_stocks(default_text: str = "") -> Optional[Dict[str, Any]]:
         result.clear()
         root.destroy()
 
+    # -- Buttons --
     btn_frame = tk.Frame(root)
-    btn_frame.pack(pady=14)
+    btn_frame.pack(pady=15)
 
-    btn_gen = tk.Button(btn_frame, text="Run", width=18, command=on_generate)
-    btn_gen.pack(side="left", padx=8)
+    btn_gen = tk.Button(btn_frame, text="GENERATE REPORT", width=25, height=2, bg="#e1f5fe",
+                        font=("Segoe UI", 10, "bold"), command=on_generate)
+    btn_gen.pack(side="left", padx=10)
 
-    btn_cancel = tk.Button(btn_frame, text="Cancel", width=12, command=on_cancel)
-    btn_cancel.pack(side="left", padx=8)
+    btn_cancel = tk.Button(btn_frame, text="Cancel", width=15, height=2, command=on_cancel)
+    btn_cancel.pack(side="left", padx=10)
 
     mode_var.trace_add("write", lambda *_: _apply_mode_ui())
     _apply_mode_ui()
