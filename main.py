@@ -1,4 +1,4 @@
-# Auto-load environment variables from .env (project root) if present.
+# Auto-load environment variables
 try:
     from env_loader import load_env
 
@@ -11,11 +11,28 @@ import sys
 import csv
 import warnings
 import traceback
-from datetime import datetime
+import logging
+from datetime import datetime, timedelta
 from time import perf_counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from openpyxl import Workbook
+
+# --- CACHING SETUP (CRITICAL FOR LOW QUOTA) ---
+try:
+    import requests_cache
+
+    requests_cache.install_cache(
+        'fmp_cache',
+        backend='sqlite',
+        expire_after=timedelta(hours=24),
+        allowable_codes=(200, 404, 400),  # Cache Errors too!
+        allowable_methods=('GET', 'POST')
+    )
+    print(f"[SYSTEM] Global API Cache Installed: 'fmp_cache.sqlite'")
+except ImportError:
+    print("[WARN] 'requests_cache' not found. Run: pip install requests-cache")
+# ----------------------------------------------
 
 from config import CHECKLIST_FILE
 from checklist_loader import load_thresholds_from_excel
@@ -31,35 +48,32 @@ from fmp_provider import FMPClient
 
 
 # ---------------------------------------------------------
-# NEW: NORMALIZATION HELPER
+# SMART NORMALIZATION
 # ---------------------------------------------------------
 def normalize_ticker_for_fmp(ticker: str) -> str | None:
-    """
-    Refactors a single ticker string to be FMP compatible.
-    - Converts 'BRK.B' -> 'BRK-B'
-    - Trims whitespace
-    - Enforces Uppercase
-    """
     if not ticker or not isinstance(ticker, str):
         return None
 
     clean_ticker = ticker.strip().upper()
 
-    # FMP REQUIREMENT: Replace dots with hyphens (e.g. BRK.B -> BRK-B)
     if '.' in clean_ticker:
-        clean_ticker = clean_ticker.replace('.', '-')
+        parts = clean_ticker.split('.')
+        suffix = parts[-1]
+        # US Share Classes (BRK.B) -> Hyphen
+        if len(suffix) == 1 and suffix in ['A', 'B', 'C']:
+            return clean_ticker.replace('.', '-')
+        # International (DSY.PA) -> Keep Dot
+        return clean_ticker
 
     return clean_ticker
 
 
 def _fmt_seconds(sec: float) -> str:
     sec = max(0.0, float(sec))
-    if sec < 60:
-        return f"{sec:.1f}s"
+    if sec < 60: return f"{sec:.1f}s"
     m = int(sec // 60)
     s = sec - m * 60
-    if m < 60:
-        return f"{m}m {s:0.0f}s"
+    if m < 60: return f"{m}m {s:0.0f}s"
     h = int(m // 60)
     m2 = m - h * 60
     return f"{h}h {m2}m"
@@ -77,14 +91,12 @@ def _find_checklist_file() -> str:
         _resource_path(CHECKLIST_FILE),
     ]
     for p in candidates:
-        if os.path.exists(p):
-            return p
+        if os.path.exists(p): return p
     return candidates[0]
 
 
 def _metrics_looks_empty(m: dict) -> bool:
-    if not isinstance(m, dict) or not m:
-        return True
+    if not isinstance(m, dict) or not m: return True
     nontrivial = [k for k in m.keys() if
                   k not in ("Ticker", "__notes__", "__yf_bundle__", "__scoring__", "__eligibility__")]
     return len(nontrivial) == 0
@@ -104,25 +116,20 @@ def _write_errors_workbook(out_path: str, tickers: list[str], errors: dict[str, 
 
 def main():
     warnings.filterwarnings("ignore")
-
-    # 1. UI Picker
     picked = ask_stocks()
     if not picked:
         print("Canceled.")
         return
 
-    # --- START PROGRESS WINDOW IMMEDIATELY ---
     prog = ProgressWindow(total_steps=100, title="Initializing...")
     prog.set_status("Loading configuration...")
 
     try:
-        # 2. Setup Configuration
         use_fmp = bool(picked.get("use_fmp", False))
         mode = picked.get("mode", "manual")
         target_eligibility_mode = picked.get("eligibility_mode", "strict")
         fmp_mode = picked.get("fmp_mode", "minimal") if use_fmp else "off"
 
-        # Load Checklist
         prog.set_status("Loading checklist...", "Reading Excel thresholds")
         checklist_path = _find_checklist_file()
         try:
@@ -132,7 +139,6 @@ def main():
             print(f"Error loading checklist from {checklist_path}: {e}")
             return
 
-        # 3. Build Ticker List (Read Inputs)
         prog.set_status("Reading input lists...", f"Mode: {mode}")
         raw_tickers_input = []
 
@@ -151,17 +157,11 @@ def main():
                 except Exception:
                     pass
         else:
-            # Manual input
             raw_str = picked.get("raw") or ""
             raw_str = raw_str.replace("\n", ",").replace("\r", ",")
             raw_tickers_input = [p.strip() for p in raw_str.split(",") if p.strip()]
 
-        # ---------------------------------------------------------------------
-        # NEW STEP 3.5: NORMALIZE TICKERS (BEFORE RESOLUTION / API CALLS)
-        # ---------------------------------------------------------------------
-        prog.set_status("Normalizing tickers...", "Formatting for FMP (BRK.B -> BRK-B)")
-
-        # Use a set to remove duplicates automatically while keeping order if possible
+        prog.set_status("Normalizing tickers...", "Formatting for FMP")
         normalized_tickers = []
         seen = set()
 
@@ -171,7 +171,6 @@ def main():
                 normalized_tickers.append(clean)
                 seen.add(clean)
 
-        # Replace the raw list with the clean list
         raw_tickers = normalized_tickers
 
         if not raw_tickers:
@@ -179,12 +178,9 @@ def main():
             print("No valid tickers found after normalization.")
             return
 
-        # ---------------------------------------------------------------------
-
-        # 4. Resolve Tickers (Yahoo Finance Validation)
         resolved = []
-        prog.pb["maximum"] = len(raw_tickers) if raw_tickers else 100
-        prog.total_steps = len(raw_tickers) if raw_tickers else 100
+        prog.pb["maximum"] = len(raw_tickers)
+        prog.total_steps = len(raw_tickers)
         prog.current = 0
 
         prog.set_status(f"Resolving {len(raw_tickers)} tickers...", "Validating existence...")
@@ -197,15 +193,10 @@ def main():
             for i, fut in enumerate(as_completed(futs)):
                 try:
                     sym = fut.result()
-                    if sym:
-                        resolved.append(sym)
+                    if sym: resolved.append(sym)
                 except Exception:
                     pass
-
-                prog.step(
-                    main_text=f"Resolving ({i + 1}/{len(raw_tickers)})",
-                    sub_text=f"Found: {len(resolved)} valid"
-                )
+                prog.step(main_text=f"Resolving ({i + 1}/{len(raw_tickers)})", sub_text=f"Found: {len(resolved)} valid")
 
         tickers = sorted(list(set(resolved)))
 
@@ -214,7 +205,6 @@ def main():
             print("No valid tickers found after resolution.")
             return
 
-        # 5. Output Setup
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_name = "MULTI_UNIVERSE" if mode == "universe" else "MANUAL_PORTFOLIO"
         if mode == "universe" and len(picked.get("universe_paths", [])) == 1:
@@ -225,14 +215,12 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, filename)
 
-        # 6. Re-Initialize Progress for Analysis Phase
         steps_total = len(tickers) + 1
         prog.pb["maximum"] = steps_total
         prog.total_steps = steps_total
         prog.current = 0
         prog.pb["value"] = 0
-        prog.set_status(f"Analyzing {len(tickers)} candidates...",
-                        f"Mode: {target_eligibility_mode.upper()} | FMP: {fmp_mode.upper()}")
+        prog.set_status(f"Analyzing {len(tickers)} candidates...", f"Mode: {target_eligibility_mode.upper()}")
 
         metrics_by_ticker: dict[str, dict] = {}
         reversal_by_ticker: dict[str, dict] = {}
@@ -245,10 +233,7 @@ def main():
 
         def _process_ticker(sym: str):
             t0 = perf_counter()
-            # Fetch Data
             metrics = compute_metrics_v2(sym, use_fmp_fallback=use_fmp, fmp_mode=fmp_mode)
-
-            # Reversal Scoring
             bundle = metrics.pop("__yf_bundle__", {}) or {}
             rev = trend_reversal_scores_from_data(
                 ticker=sym,
@@ -270,15 +255,21 @@ def main():
             for fut in as_completed(futs):
                 sym = futs[fut]
                 done_n += 1
-
                 try:
                     t_sym, m_sym, r_sym, dt = fut.result()
 
+                    # --- SILENT DROP ALERT ---
                     if _metrics_looks_empty(m_sym):
                         failed_tickers.add(t_sym)
+                        print(f"[ALERT] Dropped {t_sym}: FMP data incomplete (Circuit Breaker hit).")
+                        prog.step(
+                            main_text=f"Scanning ({done_n}/{len(tickers)})",
+                            sub_text=f"Dropped: {t_sym}",
+                            done_text=f"REASON: Data Retrieval Failed"
+                        )
                         continue
+                    # -------------------------
 
-                    # Scoring & Gating
                     scores = score_ticker(m_sym, thresholds)
                     elig = evaluate_eligibility(
                         mode=target_eligibility_mode,
@@ -311,13 +302,14 @@ def main():
 
                     fetch_durations.append(dt)
                     avg = sum(fetch_durations) / max(1, len(fetch_durations))
+
                     fmp_ok, fmp_err = FMPClient.get_stats()
-                    fmp_txt = f"{fmp_ok} OK / {fmp_err} ERR" if use_fmp else "OFF"
+                    fmp_status = f" | FMP: {fmp_ok} OK, {fmp_err} Err" if use_fmp else ""
 
                     prog.step(
                         main_text=f"Candidates found: {len(metrics_by_ticker)}",
                         sub_text=f"Added: {t_sym} ({elig.label})",
-                        done_text=f"Avg: {_fmt_seconds(avg)} | FMP: {fmp_txt}"
+                        done_text=f"Avg: {_fmt_seconds(avg)}{fmp_status}"
                     )
 
                 except Exception:
