@@ -3,18 +3,17 @@ import json
 import time
 import threading
 import hashlib
-import requests  # <--- CRITICAL: MUST USE REQUESTS FOR CACHE TO WORK
-from datetime import datetime
+import requests
 from typing import Any, Dict, Optional, Tuple
 
 
 class FMPClient:
     """Financial Modeling Prep client (Safe Mode).
 
-    CRITICAL FEATURES FOR LOW QUOTA:
-      1. Uses 'requests' so 'requests_cache' in main.py actually works.
-      2. Circuit Breaker: If Quote/Profile fails, STOPS immediately (saves 9 calls).
-      3. Negative Caching: Remembers 400/404 errors so they aren't retried.
+    CRITICAL FIXES:
+      1. URL Structure: Fixes ".../quote?symbol=TICKER" -> ".../quote/TICKER".
+      2. Library: Uses 'requests' so 'requests_cache' in main.py works.
+      3. Circuit Breaker: Stops immediately if Profile/Quote fails.
     """
 
     # --- Global Stats (Thread-Safe) ---
@@ -38,17 +37,16 @@ class FMPClient:
             cls._stat_error += 1
 
     def __init__(self, api_key: Optional[str] = None, timeout: int = 25):
+        print("[SYSTEM] FMP Client v2 (Requests + URL Fix) Loaded.")  # CONFIRMATION LOG
+
         self.api_key = (api_key or os.environ.get("FMP_API_KEY") or "").strip()
         self.timeout = timeout
         self.enabled = bool(self.api_key)
-
-        # We use a session to pool connections
         self.session = requests.Session()
 
-        # RETRIES: Set to 1 max to save quota.
+        # RETRIES: Default to 1 to save quota
         self.max_retries = int(self._safe_int(os.environ.get("FMP_MAX_RETRIES", "1")))
 
-        # Budget controls
         self.request_count = 0
         self.max_requests = self._safe_int(os.environ.get("FMP_MAX_REQUESTS", "0"), default=0)
 
@@ -67,19 +65,18 @@ class FMPClient:
     def _safe_int(v: Any, default: int = 0) -> int:
         try:
             return int(float(v))
-        except Exception:
+        except:
             return default
 
     @staticmethod
     def _safe_float(v: Any, default: float = 0.0) -> float:
         try:
             return float(v)
-        except Exception:
+        except:
             return default
 
     def _cap_limit(self, desired: int) -> Optional[int]:
-        if self.statement_limit <= 0:
-            return None
+        if self.statement_limit <= 0: return None
         return min(max(0, desired), self.statement_limit)
 
     # -----------------------
@@ -88,8 +85,7 @@ class FMPClient:
 
     def fetch_bundle(self, symbol: str, *, mode: str = "full") -> Dict[str, Any]:
         mode = (mode or "full").strip().lower()
-        if mode in ("off", "0", "false", "no"):
-            return {}
+        if mode in ("off", "0", "false", "no"): return {}
 
         if mode == "conditional":
             return self.fetch_minimal(symbol, need_profile=True, need_quote=True, need_key_metrics_ttm=True)
@@ -97,11 +93,8 @@ class FMPClient:
         if mode == "minimal":
             return self.fetch_minimal(
                 symbol,
-                need_profile=True,
-                need_quote=True,
-                need_enterprise_value=True,
-                need_ratios_ttm=True,
-                need_key_metrics_ttm=True,
+                need_profile=True, need_quote=True, need_enterprise_value=True,
+                need_ratios_ttm=True, need_key_metrics_ttm=True,
             )
 
         return self.fetch_all(symbol)
@@ -120,8 +113,8 @@ class FMPClient:
 
         data: Dict[str, Any] = {}
 
-        # --- CIRCUIT BREAKER: FAIL FAST ---
-        # If Profile OR Quote fail, the ticker is invalid. Stop immediately.
+        # --- CIRCUIT BREAKER ---
+        # If Profile or Quote fails, we stop IMMEDIATELY.
         failed_critical = False
 
         if need_profile:
@@ -139,10 +132,9 @@ class FMPClient:
                 data["quote"] = q[0] if isinstance(q, list) and q else q
 
         if failed_critical:
-            # RETURN EMPTY IMMEDIATELY. Do not fetch Ratios/Metrics.
-            # This saves ~8 calls per bad ticker.
+            print(f"[FMP PROTECTION] Aborting fetch for {symbol} (Profile/Quote failed).")
             return {}
-            # ----------------------------------
+            # -----------------------
 
         if need_key_metrics_ttm:
             km = _get("key-metrics-ttm", {})
@@ -177,7 +169,7 @@ class FMPClient:
         )
 
     # -----------------------
-    # Internal Logic (Requests + Cache)
+    # Internal Logic (FIXED URL STRUCTURE)
     # -----------------------
 
     def _get_data(self, endpoint: str, symbol: str, params: Dict[str, Any]) -> Any:
@@ -186,10 +178,14 @@ class FMPClient:
         if self.max_requests > 0 and self.request_count >= self.max_requests:
             return None
 
-        base_url = f"https://financialmodelingprep.com/stable/{endpoint}"
+        # --- FIX: PUT SYMBOL IN PATH ---
+        # Correct: .../quote/AAPL?apikey=...
+        # Wrong:   .../quote?symbol=AAPL&apikey=...
+        base_url = f"https://financialmodelingprep.com/api/v3/{endpoint}/{symbol}"
+
         req_params = params.copy()
-        req_params["symbol"] = symbol
         req_params["apikey"] = self.api_key
+        # Note: We do NOT put 'symbol' in req_params anymore.
 
         # Cache Key
         cache_str = f"{endpoint}_{symbol}_{json.dumps(params, sort_keys=True)}"
@@ -199,7 +195,7 @@ class FMPClient:
         cached = self._read_cache(cache_key)
         if cached is not None:
             if isinstance(cached, dict) and "_error" in cached:
-                return None  # Do not retry known errors
+                return None
             return cached
 
         # 2. NETWORK REQUEST
