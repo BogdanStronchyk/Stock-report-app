@@ -43,6 +43,7 @@ def ask_stocks(default_text: str = "") -> Optional[Dict[str, Any]]:
         'raw': 'AAPL,MSFT' (manual mode only),
         'universe_paths': ['/path/to/sp500.csv', ...],
         'use_fmp': bool,
+        'fmp_mode': 'conditional' | 'minimal' | 'full',  <-- NEW
         'eligibility_mode': 'strict' | 'permissible' | 'loose'
       }
     """
@@ -51,6 +52,7 @@ def ask_stocks(default_text: str = "") -> Optional[Dict[str, Any]]:
         "raw": None,
         "universe_paths": [],
         "use_fmp": False,
+        "fmp_mode": "minimal",
         "eligibility_mode": "strict"
     }
 
@@ -64,8 +66,8 @@ def ask_stocks(default_text: str = "") -> Optional[Dict[str, Any]]:
     root = tk.Tk()
     root.title("Stock Report App — Portfolio Generator")
 
-    # --- CHANGE: Increased Height for better button visibility ---
-    root.geometry("680x750")
+    # Adjusted size for taller text box + new dropdown
+    root.geometry("680x820")
     root.resizable(True, True)
 
     try:
@@ -96,12 +98,12 @@ def ask_stocks(default_text: str = "") -> Optional[Dict[str, Any]]:
 
     hint = tk.Label(
         man_frame,
-        text="Enter tickers separated by commas (e.g. AAPL, MSFT, GOOG):",
+        text="Enter tickers separated by commas OR new lines (e.g. AAPL, MSFT):",
         font=("Segoe UI", 9)
     )
     hint.pack(anchor="w", pady=(0, 5))
 
-    entry = tk.Text(man_frame, height=3, font=("Consolas", 11))
+    entry = tk.Text(man_frame, height=8, font=("Consolas", 11))
     entry.pack(fill="x")
     if default_text:
         entry.insert("1.0", default_text)
@@ -137,39 +139,53 @@ def ask_stocks(default_text: str = "") -> Optional[Dict[str, Any]]:
             chk.pack(anchor="w", pady=2)
             univ_vars[path] = var
 
-    # -- Filtering Strategy (NEW) --
+    # -- Filtering Strategy --
     strat_frame = tk.LabelFrame(root, text="Filtering Strategy", padx=15, pady=10)
     strat_frame.pack(fill="x", padx=20, pady=(5, 10))
 
     rule_var = tk.StringVar(value="strict")
 
-    r_strict = tk.Radiobutton(strat_frame, text="Strict (Portfolio Candidates)", variable=rule_var, value="strict",
+    r_strict = tk.Radiobutton(strat_frame, text="Strict (Portfolio)", variable=rule_var, value="strict",
                               font=("Segoe UI", 9, "bold"))
     r_perm = tk.Radiobutton(strat_frame, text="Standard (Watchlist)", variable=rule_var, value="permissible",
                             font=("Segoe UI", 9))
-    r_loose = tk.Radiobutton(strat_frame, text="Loose (Broad Scan)", variable=rule_var, value="loose",
-                             font=("Segoe UI", 9))
+    r_loose = tk.Radiobutton(strat_frame, text="Loose (Scan)", variable=rule_var, value="loose", font=("Segoe UI", 9))
 
     r_strict.pack(side="left", padx=(0, 20))
     r_perm.pack(side="left", padx=(0, 20))
     r_loose.pack(side="left")
 
-    # -- FMP Toggle --
-    fmp_frame = tk.Frame(root)
-    fmp_frame.pack(pady=(0, 10))
+    # -- FMP Settings (NEW: Checkbox + Dropdown) --
+    fmp_frame = tk.LabelFrame(root, text="FMP API Settings", padx=15, pady=10)
+    fmp_frame.pack(fill="x", padx=20, pady=(0, 10))
 
+    # 1. Toggle
     use_fmp_var = tk.BooleanVar(value=result["use_fmp"])
-    fmp_label = "Enable FMP Data Fallback"
+    fmp_label = "Enable FMP Data"
     if forced:
-        fmp_label += " (Locked: FORCE_FMP_FALLBACK=1)"
+        fmp_label += " (Locked: Forced)"
     elif not has_fmp_key:
-        fmp_label += " (Requires FMP_API_KEY)"
+        fmp_label += " (No API Key)"
 
-    chk_fmp = tk.Checkbutton(fmp_frame, text=fmp_label, variable=use_fmp_var, font=("Segoe UI", 9))
+    chk_fmp = tk.Checkbutton(fmp_frame, text=fmp_label, variable=use_fmp_var, font=("Segoe UI", 9, "bold"))
     if forced:
         chk_fmp.configure(state="disabled")
         use_fmp_var.set(True)
-    chk_fmp.pack()
+    elif not has_fmp_key:
+        chk_fmp.configure(state="disabled")
+    chk_fmp.pack(side="left", padx=(0, 15))
+
+    # 2. Depth Selector
+    tk.Label(fmp_frame, text="Depth:", font=("Segoe UI", 9)).pack(side="left")
+
+    depth_var = tk.StringVar(value="Minimal (5 calls)")
+    depth_options = [
+        "Conditional (3 calls) - Fastest",
+        "Minimal (5 calls) - Standard",
+        "Full (8+ calls) - Deep Dive"
+    ]
+    depth_menu = ttk.Combobox(fmp_frame, textvariable=depth_var, values=depth_options, state="readonly", width=25)
+    depth_menu.pack(side="left", padx=(5, 0))
 
     # -- Logic --
     def _apply_mode_ui():
@@ -182,11 +198,28 @@ def ask_stocks(default_text: str = "") -> Optional[Dict[str, Any]]:
         else:
             univ_frame.configure(fg="gray", text="Available Universes (Disabled)")
 
+        # Enable/Disable dropdown based on checkbox
+        if use_fmp_var.get():
+            depth_menu.configure(state="readonly")
+        else:
+            depth_menu.configure(state="disabled")
+
+    use_fmp_var.trace_add("write", lambda *_: _apply_mode_ui())
+
     def on_generate():
         mode = mode_var.get()
         result["mode"] = mode
         result["use_fmp"] = bool(use_fmp_var.get())
         result["eligibility_mode"] = rule_var.get()
+
+        # Parse depth selection
+        raw_depth = depth_var.get().lower()
+        if "conditional" in raw_depth:
+            result["fmp_mode"] = "conditional"
+        elif "full" in raw_depth:
+            result["fmp_mode"] = "full"
+        else:
+            result["fmp_mode"] = "minimal"
 
         if mode == "manual":
             raw = entry.get("1.0", "end").strip()
