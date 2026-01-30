@@ -999,3 +999,96 @@ def create_report_workbook(
 
     autosize(ws_sum)
     wb.save(out_path)
+
+
+def create_scan_workbook(
+    tickers: List[str],
+    metrics_by_ticker: Dict[str, Dict[str, Any]],
+    out_path: str,
+    *,
+    title: str = "Scan Results",
+):
+    """Create a lightweight workbook intended for broad index scans.
+
+    Broad scans can include hundreds/thousands of tickers. Generating full per-ticker
+    sheets is slow and produces very large files. This writer outputs a single,
+    sortable table with the key scan fields.
+    """
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = title
+
+    headers = [
+        "Ticker",
+        "Yahoo Sector",
+        "Yahoo Industry",
+        "Sector Bucket",
+        "Price",
+        "Market Cap",
+        "Avg $ Volume (63d)",
+        "Beta",
+        "Max Drawdown 3Y (%)",
+        "Realized Vol 1Y (%)",
+        "NUPL Regime",
+        "Composite NUPL",
+    ]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.fill = FILL_HDR
+        cell.font = FONT_HDR
+        cell.alignment = ALIGN_CENTER
+
+    for t in tickers:
+        m = metrics_by_ticker.get(t, {}) or {}
+        ws.append([
+            t,
+            m.get("Yahoo Sector"),
+            m.get("Yahoo Industry"),
+            m.get("Sector Bucket", "Default (All)"),
+            m.get("Price"),
+            m.get("Market Cap"),
+            m.get("Avg $ Volume (63d)"),
+            m.get("Beta"),
+            m.get("Max Drawdown 3Y (%)"),
+            m.get("Realized Vol 1Y (%)"),
+            m.get("NUPL Regime"),
+            m.get("Composite NUPL"),
+        ])
+
+    # Basic formatting
+    ws.freeze_panes = "A2"
+
+    # Column widths (rough but readable)
+    widths = {
+        "A": 10,
+        "B": 18,
+        "C": 26,
+        "D": 16,
+        "E": 10,
+        "F": 14,
+        "G": 16,
+        "H": 8,
+        "I": 18,
+        "J": 18,
+        "K": 14,
+        "L": 14,
+    }
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+
+    # Number formats
+    # Price
+    for r in range(2, ws.max_row + 1):
+        ws[f"E{r}"].number_format = "0.00"
+        ws[f"F{r}"].number_format = "0"  # market cap
+        ws[f"G{r}"].number_format = "0"  # avg $ vol
+        ws[f"H{r}"].number_format = "0.00"  # beta
+        ws[f"I{r}"].number_format = '0.00"%"'
+        ws[f"J{r}"].number_format = '0.00"%"'
+        ws[f"L{r}"].number_format = "0.00"
+
+    # Add Excel auto-filter
+    ws.auto_filter.ref = f"A1:L{ws.max_row}"
+
+    wb.save(out_path)

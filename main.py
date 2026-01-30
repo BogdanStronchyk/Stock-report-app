@@ -21,8 +21,9 @@ from config import CHECKLIST_FILE
 from checklist_loader import load_thresholds_from_excel
 from input_resolver import resolve_to_ticker
 from metrics import compute_metrics_v2
+from metrics_scan import compute_metrics_scan
 from reversal import trend_reversal_scores_from_data
-from report_writer import create_report_workbook
+from report_writer import create_report_workbook, create_scan_workbook
 from ui_dialogs import ask_output_directory
 from ui_stock_picker import ask_stocks
 from ui_progress import ProgressWindow, success_popup
@@ -81,17 +82,63 @@ def _write_errors_workbook(out_path: str, tickers: list[str], errors: dict[str, 
 def main():
     warnings.filterwarnings("ignore")
 
-    checklist_path = _find_checklist_file()
-    thresholds = load_thresholds_from_excel(checklist_path)
+    # NOTE: thresholds/checklist are only needed for shortlist/portfolio (full reports).
+    thresholds = None
 
     picked = ask_stocks()
     if not picked:
         print("Canceled.")
         return
 
-    raw, use_fmp = picked
+    # New picker returns a dict (mode/manual/universe, stage selection, FMP toggle)
+    if isinstance(picked, dict):
+        use_fmp = bool(picked.get("use_fmp", True))
+        ui_stage = (picked.get("analysis_stage") or "").strip().lower()
+        if ui_stage:
+            # propagate to env so downstream code picks it up consistently
+            os.environ["ANALYSIS_STAGE"] = ui_stage
 
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
+        analysis_stage = (os.environ.get("ANALYSIS_STAGE") or "portfolio").strip().lower()
+
+        mode = (picked.get("mode") or "manual").strip().lower()
+        if mode == "universe":
+            universe_path = picked.get("universe_path")
+            if not universe_path or not os.path.exists(universe_path):
+                print("Universe CSV missing:", universe_path)
+                return
+            raw = None
+        else:
+            raw = picked.get("raw") or ""
+            universe_path = None
+    else:
+        # Backward-compat (old tuple return)
+        raw, use_fmp = picked
+        mode = "manual"
+        universe_path = None
+
+        analysis_stage = (os.environ.get("ANALYSIS_STAGE") or "portfolio").strip().lower()
+
+    # Load checklist thresholds only when needed (keeps broad scans fast).
+    if analysis_stage not in ("broad", "scan", "wide"):
+        checklist_path = _find_checklist_file()
+        thresholds = load_thresholds_from_excel(checklist_path)
+
+    # Build ticker list
+    if mode == "universe":
+        import csv
+        parts = []
+        with open(universe_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if not row:
+                    continue
+                v = (row[0] or "").strip()
+                if not v or v.lower() in ("ticker", "symbol"):
+                    continue
+                parts.append(v)
+    else:
+        parts = [p.strip() for p in (raw or "").split(",") if p.strip()]
+
     resolved, unresolved = [], []
 
     for p in parts:
@@ -113,11 +160,16 @@ def main():
             print("Unresolved:", ", ".join(unresolved))
         return
 
+    # Timestamp for output file name (always defined)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     if unresolved:
         print("Skipped unresolved:", ", ".join(unresolved))
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = "_".join(tickers)
+    if mode == "universe":
+        base = (picked.get("universe_name") if isinstance(picked, dict) else "UNIVERSE") or "UNIVERSE"
+        base = str(base).replace(" ", "_")
+    else:
+        base = "_".join(tickers[:10]) + ("_etc" if len(tickers) > 10 else "")
     filename = f"{base}_{ts}.xlsx"
 
     out_dir = ask_output_directory(default_subfolder="reports")
@@ -157,19 +209,25 @@ def main():
 
         def _analyze_one(sym: str):
             t0 = perf_counter()
-            metrics = compute_metrics_v2(sym, use_fmp_fallback=use_fmp, fmp_mode=fmp_mode)
-            bundle = metrics.pop("__yf_bundle__", {}) or {}
 
-            rev = trend_reversal_scores_from_data(
-                ticker=sym,
-                info=bundle.get("info"),
-                q_income=bundle.get("q_income"),
-                q_cf=bundle.get("q_cf"),
-                annual_bs=bundle.get("annual_bs"),
-                h_1y=bundle.get("h1y"),
-                h_2y=bundle.get("h2y"),
-                metrics=metrics,
-            )
+            # Broad scan: cheap Yahoo-only metrics (no statements / no reversal)
+            if stage in ("broad", "scan", "wide"):
+                metrics = compute_metrics_scan(sym)
+                rev = {}
+            else:
+                metrics = compute_metrics_v2(sym, use_fmp_fallback=use_fmp, fmp_mode=fmp_mode)
+                bundle = metrics.pop("__yf_bundle__", {}) or {}
+                rev = trend_reversal_scores_from_data(
+                    ticker=sym,
+                    info=bundle.get("info"),
+                    q_income=bundle.get("q_income"),
+                    q_cf=bundle.get("q_cf"),
+                    annual_bs=bundle.get("annual_bs"),
+                    h_1y=bundle.get("h1y"),
+                    h_2y=bundle.get("h2y"),
+                    metrics=metrics,
+                )
+
             dt = perf_counter() - t0
             return sym, metrics, rev, dt
 
@@ -233,14 +291,22 @@ def main():
             success_popup(out_path)
             return
 
-        prog.step(main_text="Writing Excel report...", sub_text="Applying checklist + scores + colors")
-        create_report_workbook(
-            tickers=tickers,
-            thresholds=thresholds,
-            metrics_by_ticker=metrics_by_ticker,
-            reversal_by_ticker=reversal_by_ticker,
-            out_path=out_path
-        )
+        if analysis_stage in ("broad", "scan", "wide"):
+            prog.step(main_text="Writing scan workbook...", sub_text="Single-sheet table (fast)")
+            create_scan_workbook(
+                tickers=tickers,
+                metrics_by_ticker=metrics_by_ticker,
+                out_path=out_path,
+            )
+        else:
+            prog.step(main_text="Writing Excel report...", sub_text="Applying checklist + scores + colors")
+            create_report_workbook(
+                tickers=tickers,
+                thresholds=thresholds or {},
+                metrics_by_ticker=metrics_by_ticker,
+                reversal_by_ticker=reversal_by_ticker,
+                out_path=out_path
+            )
         prog.step(main_text="Done!", sub_text=out_path)
 
         # Write error log if some tickers failed (so you can quickly see why without hunting in the workbook).
