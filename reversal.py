@@ -175,11 +175,29 @@ def _tech_structure(hist: pd.DataFrame) -> Tuple[int, str]:
     return (0, "Short-term Bearish")
 
 
+def _tech_relative_strength(metrics: Dict[str, Any]) -> Tuple[int, str]:
+    rel = metrics.get("Sector Relative Return (1Y)")
+    if rel is None:
+        return (0, "No Data")
+
+    # Logic:
+    # > 5.0% Alpha = Green (2)
+    # -5.0% to 5.0% = Yellow (1)
+    # < -5.0% = Red (0)
+
+    if rel > 5.0:
+        return (2, f"Leading Sector (+{rel:.1f}%)")
+    if rel >= -5.0:
+        return (1, f"Inline ({rel:.1f}%)")
+    return (0, f"Lagging Sector ({rel:.1f}%)")
+
+
 # ==========================
 # Main Scoring
 # ==========================
 FUND_WEIGHTS = {"Margins": 0.3, "Cashflow": 0.3, "Balance Sheet": 0.2, "ROIC": 0.1, "Valuation": 0.1}
-TECH_WEIGHTS = {"Trend (200d)": 0.4, "Momentum (RSI)": 0.2, "Drawdown": 0.2, "Structure": 0.2}
+# Updated weights to include Rel Strength
+TECH_WEIGHTS = {"Trend (200d)": 0.3, "Momentum (RSI)": 0.2, "Drawdown": 0.2, "Structure": 0.1, "Rel Strength": 0.2}
 
 
 def _calculate_weighted(items: Dict[str, Tuple[int, str]], weights: Dict[str, float]) -> float:
@@ -206,6 +224,7 @@ def trend_reversal_scores_from_data(*, q_income=None, q_cf=None, annual_income=N
     tech["Momentum (RSI)"] = _tech_rsi_mom(h_1y)
     tech["Drawdown"] = _tech_drawdown(h_1y)
     tech["Structure"] = _tech_structure(h_1y)
+    tech["Rel Strength"] = _tech_relative_strength(metrics or {})
 
     f_score = _calculate_weighted(fund, FUND_WEIGHTS)
     t_score = _calculate_weighted(tech, TECH_WEIGHTS)

@@ -6,7 +6,7 @@ import yfinance as yf
 from cache_utils import DiskCache, yf_call, yf_cache_settings
 from config import FORCE_FMP_FALLBACK
 from value_matrix_extras import compute_value_matrix_extras
-from sector_map import map_sector
+from sector_map import map_sector, get_sector_benchmark  # <--- UPDATED IMPORT
 from fmp_provider import FMPClient
 
 _MULTIPLIERS = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}
@@ -210,9 +210,50 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True, *, fmp_mode: 
         c = h3y["Close"]
         max_dd = ((c / c.cummax() - 1).min()) * 100
 
+    # ----------------------------------------------------
+    # NEW: Fetch Benchmark & Calculate Relative Return
+    # ----------------------------------------------------
+    sector_bucket = map_sector(info.get("sector"), info.get("industry"))
+    bench_ticker = get_sector_benchmark(sector_bucket)
+    rel_return_1y = None
+
+    if not h1y.empty:
+        # Define fetcher for benchmark
+        def _get_bench_hist():
+            b_tkr = yf.Ticker(bench_ticker)
+            return _history_retry(bench_ticker, b_tkr, period="1y")
+
+        # Reuse existing cache logic for benchmark history
+        h_bench = ensure_df(_cached_df(f"hist:{bench_ticker}:1y", _get_bench_hist))
+
+        if not h_bench.empty:
+            try:
+                # 1. Stock Return (1Y)
+                # Filter h1y to roughly match benchmark's available range if needed,
+                # but usually 1y fetch is aligned enough.
+                s_start = float(h1y["Close"].iloc[0])
+                s_end = float(h1y["Close"].iloc[-1])
+                s_ret = (s_end - s_start) / s_start * 100.0
+
+                # 2. Benchmark Return (1Y)
+                # Align benchmark start date to stock's start date
+                start_dt = h1y.index[0]
+                b_slice = h_bench.loc[h_bench.index >= start_dt]
+
+                if not b_slice.empty:
+                    b_start = float(b_slice["Close"].iloc[0])
+                    b_end = float(b_slice["Close"].iloc[-1])
+                    b_ret = (b_end - b_start) / b_start * 100.0
+
+                    # 3. Spread
+                    rel_return_1y = s_ret - b_ret
+            except Exception:
+                pass
+
     metrics = {
         "Ticker": ticker, "Price": price, "Market Cap": mcap,
-        "Sector Bucket": map_sector(info.get("sector"), info.get("industry")),
+        "Sector Bucket": sector_bucket,
+        "Sector Relative Return (1Y)": rel_return_1y,  # <--- NEW FIELD
         "P/E (TTM, positive EPS)": pe, "EV/EBIT": ev_ebit, "FCF Yield (TTM FCF / Market Cap)": fcf_yield,
         "Gross Margin %": gross_m, "Operating Margin %": op_m, "ROIC % (standardized)": roic,
         "Net Debt / EBITDA": nd_ebitda, "Interest Coverage (EBIT / Interest)": int_cov,
