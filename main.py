@@ -1,20 +1,18 @@
-# Auto-load environment variables from .env (project root) if present.
-# IMPORTANT: must run before importing modules that read os.environ (config/metrics/fmp).
 try:
     from env_loader import load_env
+
     load_env()
 except Exception:
     pass
 
 import os
 import sys
-import warnings
+import re
 import traceback
 from datetime import datetime
 from time import perf_counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import yfinance as yf
 from openpyxl import Workbook
 
 from config import CHECKLIST_FILE
@@ -29,16 +27,8 @@ from ui_progress import ProgressWindow, success_popup
 
 
 def _fmt_seconds(sec: float) -> str:
-    sec = max(0.0, float(sec))
-    if sec < 60:
-        return f"{sec:.1f}s"
-    m = int(sec // 60)
-    s = sec - m * 60
-    if m < 60:
-        return f"{m}m {s:0.0f}s"
-    h = int(m // 60)
-    m2 = m - h * 60
-    return f"{h}h {m2}m"
+    if sec < 60: return f"{sec:.1f}s"
+    return f"{int(sec // 60)}m {sec % 60:.0f}s"
 
 
 def _resource_path(relative_path: str) -> str:
@@ -53,213 +43,130 @@ def _find_checklist_file() -> str:
         _resource_path(CHECKLIST_FILE),
     ]
     for p in candidates:
-        if os.path.exists(p):
-            return p
+        if os.path.exists(p): return p
     return candidates[0]
 
 
-def _metrics_looks_empty(m: dict) -> bool:
-    """Heuristic: if we only have identity/notes keys, analysis effectively failed."""
-    if not isinstance(m, dict) or not m:
-        return True
-    nontrivial = [k for k in m.keys() if k not in ("Ticker", "__notes__", "__yf_bundle__")]
-    return len(nontrivial) == 0
-
-
-def _write_errors_workbook(out_path: str, tickers: list[str], errors: dict[str, str]) -> None:
+def _write_errors_workbook(out_path: str, tickers: list, errors: dict):
     wb = Workbook()
     ws = wb.active
     ws.title = "Errors"
-    ws.append(["Ticker", "Error (traceback)"])
+    ws.append(["Ticker", "Error"])
     for t in tickers:
-        ws.append([t, (errors.get(t) or "")[:30000]])
-    ws.column_dimensions["A"].width = 14
-    ws.column_dimensions["B"].width = 140
+        ws.append([t, errors.get(t, "")[:30000]])
     wb.save(out_path)
 
 
-def main():
-    warnings.filterwarnings("ignore")
+def _analyze_one(sym: str, use_fmp: bool, fmp_mode: str):
+    try:
+        metrics = compute_metrics_v2(sym, use_fmp_fallback=use_fmp, fmp_mode=fmp_mode)
 
+        # Pass the FULL data bundle to reversal script so it doesn't say "Missing Data"
+        bundle = metrics.get("__yf_bundle__", {})
+
+        rev = trend_reversal_scores_from_data(
+            q_income=bundle.get("q_income"),
+            q_cf=bundle.get("q_cf"),
+            annual_bs=bundle.get("annual_bs"),
+            annual_income=bundle.get("annual_income"),
+            annual_cf=bundle.get("annual_cf"),
+            h_1y=bundle.get("h1y"),
+            h_2y=bundle.get("h2y"),
+            metrics=metrics
+        )
+        return (sym, metrics, rev, None)
+    except Exception:
+        return (sym, None, None, traceback.format_exc())
+
+
+def main():
+    print("Stock Report App - Starting...")
     checklist_path = _find_checklist_file()
+    if not os.path.exists(checklist_path):
+        print(f"ERROR: Checklist file not found at {checklist_path}")
+        return
+
+    print(f"Loading checklist from: {checklist_path}")
     thresholds = load_thresholds_from_excel(checklist_path)
 
-    picked = ask_stocks()
-    if not picked:
-        print("Canceled.")
+    # --- FIX: Correctly unpack the Tuple from the UI ---
+    picker_result = ask_stocks()
+    if not picker_result: return
+
+    raw_text, user_wants_fmp = picker_result
+
+    raw_tokens = [s.strip() for s in re.split(r'[,\n\s]+', raw_text) if s.strip()]
+    if not raw_tokens:
+        print("No tickers entered.")
         return
 
-    raw, use_fmp = picked
+    print(f"Resolving {len(raw_tokens)} symbols...")
+    tickers = []
+    for tok in raw_tokens:
+        sym = resolve_to_ticker(tok)
+        if sym: tickers.append(sym)
 
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    resolved, unresolved = [], []
+    tickers = sorted(list(set(tickers)))
+    if not tickers: return
 
-    for p in parts:
-        sym = resolve_to_ticker(p)
-        if sym:
-            resolved.append(sym)
-        else:
-            unresolved.append(p)
+    out_dir = ask_output_directory()
+    if not out_dir: return
 
-    tickers, seen = [], set()
-    for t in resolved:
-        if t not in seen:
-            seen.add(t)
-            tickers.append(t)
+    env_key = os.environ.get("FMP_API_KEY")
+    use_fmp = bool(env_key) and (user_wants_fmp or bool(os.environ.get("FORCE_FMP_FALLBACK")))
+    fmp_mode = os.environ.get("FMP_MODE", "full")
 
-    if not tickers:
-        print("Could not resolve any tickers.")
-        if unresolved:
-            print("Unresolved:", ", ".join(unresolved))
-        return
+    print(f"Analyzing {len(tickers)} tickers...")
 
-    if unresolved:
-        print("Skipped unresolved:", ", ".join(unresolved))
+    metrics_map = {}
+    reversal_map = {}
+    errors_map = {}
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = "_".join(tickers)
-    filename = f"{base}_{ts}.xlsx"
+    pwin = ProgressWindow(len(tickers) + 1, title="Analyzing Stocks...")
 
-    out_dir = ask_output_directory(default_subfolder="reports")
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, filename)
+    start_t = perf_counter()
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_analyze_one, t, use_fmp, fmp_mode): t for t in tickers}
 
-    steps_total = len(tickers) + 2
-    prog = ProgressWindow(total_steps=steps_total, title="Stock Report App — Generating")
+        for fut in as_completed(futures):
+            t_sym, m_data, r_data, err = fut.result()
+            if err:
+                errors_map[t_sym] = err
+                print(f"X {t_sym}")
+            else:
+                metrics_map[t_sym] = m_data
+                reversal_map[t_sym] = r_data
+                print(f"OK {t_sym}")
 
-    metrics_by_ticker: dict[str, dict] = {}
-    reversal_by_ticker: dict[str, dict] = {}
-    errors: dict[str, str] = {}
-    failed: set[str] = set()
+            pwin.step(sub_text=f"Analyzed {t_sym}")
 
-    try:
-        prog.set_status("Fetching data...", f"Tickers: {', '.join(tickers)}")
+    duration = perf_counter() - start_t
+    print(f"Analysis done in {_fmt_seconds(duration)}")
 
-        fetch_durations = []
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    sanitized = "_".join(tickers[:5])
+    if len(tickers) > 5: sanitized += "_etc"
 
-        # Stage-based FMP behavior:
-        #  - broad/scan      : no FMP
-        #  - narrow/shortlist: minimal FMP bundle
-        #  - portfolio       : full FMP bundle
-        stage = (os.environ.get("ANALYSIS_STAGE", "") or "").strip().lower()
-        if stage in ("broad", "scan", "wide"):
-            stage_fmp_mode = "off"
-        elif stage in ("narrow", "shortlist", "screen"):
-            stage_fmp_mode = "minimal"
-        else:
-            stage_fmp_mode = "full"
+    out_file = os.path.join(out_dir, f"{sanitized}_{timestamp}.xlsx")
 
-        # User toggle can still disable FMP entirely
-        fmp_mode = stage_fmp_mode if use_fmp else "off"
+    pwin.step(main_text="Writing Report...", sub_text="Formatting Excel...")
 
-        max_workers = int(float(os.environ.get("YF_MAX_WORKERS", "6") or "6"))
-        max_workers = max(1, min(32, max_workers))
+    create_report_workbook(
+        tickers=[t for t in tickers if t in metrics_map],
+        thresholds=thresholds,
+        metrics_by_ticker=metrics_map,
+        reversal_by_ticker=reversal_map,
+        out_path=out_file
+    )
 
-        def _analyze_one(sym: str):
-            t0 = perf_counter()
-            metrics = compute_metrics_v2(sym, use_fmp_fallback=use_fmp, fmp_mode=fmp_mode)
-            bundle = metrics.pop("__yf_bundle__", {}) or {}
+    pwin.close()
 
-            rev = trend_reversal_scores_from_data(
-                ticker=sym,
-                info=bundle.get("info"),
-                q_income=bundle.get("q_income"),
-                q_cf=bundle.get("q_cf"),
-                annual_bs=bundle.get("annual_bs"),
-                h_1y=bundle.get("h1y"),
-                h_2y=bundle.get("h2y"),
-                metrics=metrics,
-            )
-            dt = perf_counter() - t0
-            return sym, metrics, rev, dt
+    if errors_map:
+        err_file = os.path.join(out_dir, f"{sanitized}_{timestamp}_errors.xlsx")
+        _write_errors_workbook(err_file, tickers, errors_map)
+        print(f"Errors written to {err_file}")
 
-        prog.set_status("Fetching + scoring (concurrent)...", f"Tickers: {', '.join(tickers)}")
-
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futs = {ex.submit(_analyze_one, t): t for t in tickers}
-            done_n = 0
-            for fut in as_completed(futs):
-                sym = futs[fut]
-                done_n += 1
-                try:
-                    t_sym, m_sym, r_sym, dt = fut.result()
-                except Exception:
-                    dt = 0.0
-                    tb = traceback.format_exc()
-                    errors[sym] = tb
-                    failed.add(sym)
-                    # Keep a placeholder so the workbook can still include the ticker tab/summary row.
-                    t_sym, m_sym, r_sym = sym, {"Ticker": sym, "__notes__": {"Error": "See Errors sheet / error log"}}, {}
-
-                # Mark as failed if output is effectively empty
-                if _metrics_looks_empty(m_sym):
-                    failed.add(t_sym)
-                    if t_sym not in errors:
-                        errors[t_sym] = "Metrics returned empty/near-empty dict."
-
-                metrics_by_ticker[t_sym] = m_sym
-                reversal_by_ticker[t_sym] = r_sym
-
-                fetch_durations.append(dt)
-                avg = sum(fetch_durations) / max(1, len(fetch_durations))
-                remaining = max(0, len(tickers) - done_n)
-                eta = remaining * avg
-                done_txt = (
-                    f"Done: {done_n}/{len(tickers)} | ({t_sym}): {_fmt_seconds(dt)} "
-                    f"| Avg: {_fmt_seconds(avg)} | ETA: {_fmt_seconds(eta)} "
-                    f"| Workers: {max_workers} | FMP: {fmp_mode}"
-                )
-                if t_sym in failed:
-                    done_txt += " | ⚠ failed"
-                prog.step(main_text=f"Processed ({done_n}/{len(tickers)})", sub_text=t_sym, done_text=done_txt)
-
-        # If EVERYTHING failed, do not emit a misleading "empty" report.
-        if len(failed) == len(tickers):
-            prog.step(main_text="All tickers failed", sub_text="Writing an Errors workbook instead…")
-            _write_errors_workbook(out_path, tickers, errors)
-
-            # also write a plain-text error log for quick copy/paste
-            try:
-                log_path = os.path.splitext(out_path)[0] + "_errors.txt"
-                with open(log_path, "w", encoding="utf-8") as f:
-                    for t in tickers:
-                        f.write(f"=== {t} ===\n")
-                        f.write(errors.get(t, "") + "\n\n")
-                print("⚠ Error log:", log_path)
-            except Exception:
-                pass
-
-            print("❌ All tickers failed. Saved errors workbook:", out_path)
-            success_popup(out_path)
-            return
-
-        prog.step(main_text="Writing Excel report...", sub_text="Applying checklist + scores + colors")
-        create_report_workbook(
-            tickers=tickers,
-            thresholds=thresholds,
-            metrics_by_ticker=metrics_by_ticker,
-            reversal_by_ticker=reversal_by_ticker,
-            out_path=out_path
-        )
-        prog.step(main_text="Done!", sub_text=out_path)
-
-        # Write error log if some tickers failed (so you can quickly see why without hunting in the workbook).
-        if failed:
-            try:
-                log_path = os.path.splitext(out_path)[0] + "_errors.txt"
-                with open(log_path, "w", encoding="utf-8") as f:
-                    for t in sorted(failed):
-                        f.write(f"=== {t} ===\n")
-                        f.write(errors.get(t, "") + "\n\n")
-                print("⚠ Some tickers failed. Error log:", log_path)
-            except Exception:
-                pass
-
-    finally:
-        prog.close()
-
-    print("✅ DONE:", out_path)
-    success_popup(out_path)
+    success_popup(out_file)
 
 
 if __name__ == "__main__":

@@ -19,22 +19,27 @@ def _to_num(x):
 def _safe_series(df: pd.DataFrame, row_names, n: int = 8) -> Optional[pd.Series]:
     if df is None or df.empty: return None
     for rn in row_names:
-        if rn in df.index: return pd.to_numeric(df.loc[rn].iloc[:n], errors="coerce")
+        if rn in df.index:
+            row = df.loc[rn]
+            if isinstance(row, pd.DataFrame): row = row.iloc[0]
+            return pd.to_numeric(row.iloc[:n], errors="coerce")
     return None
 
 
 def _get_close_series(hist: pd.DataFrame) -> pd.Series:
-    """Safely extract Close or Adj Close from history."""
     if hist is None or hist.empty: return pd.Series(dtype=float)
-    col = "Adj Close" if "Adj Close" in hist.columns else "Close"
-    if col in hist.columns:
-        return pd.to_numeric(hist[col], errors="coerce").dropna()
+    df = hist.copy()
+    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+    col = "Adj Close" if "Adj Close" in df.columns else "Close"
+    if col in df.columns: return pd.to_numeric(df[col], errors="coerce").dropna()
     return pd.Series(dtype=float)
 
 
-def _ttm_and_prev_ttm(series: pd.Series) -> Tuple[Optional[float], Optional[float]]:
-    if series is None or series.dropna().shape[0] < 8: return (None, None)
-    return (_to_num(series.iloc[:4].sum()), _to_num(series.iloc[4:8].sum()))
+def _calc_trend_score(current: Optional[float], previous: Optional[float], label: str) -> Tuple[int, str]:
+    if current is None or previous is None: return (0, "Insufficient Data")
+    if current > previous: return (2, f"{label} Rising")
+    if current > previous * 0.95: return (1, f"{label} Stable")
+    return (0, f"{label} Declining")
 
 
 def _score_symbol(points: int) -> str:
@@ -42,95 +47,102 @@ def _score_symbol(points: int) -> str:
 
 
 # ==========================
-# Fundamental Turnaround
+# Fundamental Turnaround (With Fallback)
 # ==========================
-def _fund_margin_stabilization(q_income: pd.DataFrame) -> Tuple[int, str]:
-    rev = _safe_series(q_income, ["Total Revenue", "TotalRevenue"], 8)
-    opi = _safe_series(q_income, ["Operating Income", "OperatingIncome"], 8)
-    if rev is None or opi is None: return (0, "Missing data")
+def _fund_margin_trend(q_income: pd.DataFrame, a_income: pd.DataFrame) -> Tuple[int, str]:
+    # 1. Try Quarterly TTM (Need 8 qtrs)
+    q_rev = _safe_series(q_income, ["Total Revenue", "TotalRevenue"], 8)
+    q_opi = _safe_series(q_income, ["Operating Income", "OperatingIncome"], 8)
 
-    rev_ttm, rev_prev = _ttm_and_prev_ttm(rev)
-    op_ttm, op_prev = _ttm_and_prev_ttm(opi)
+    if q_rev is not None and len(q_rev) >= 8 and q_opi is not None and len(q_opi) >= 8:
+        ttm_rev = q_rev.iloc[:4].sum();
+        prev_rev = q_rev.iloc[4:8].sum()
+        ttm_opi = q_opi.iloc[:4].sum();
+        prev_opi = q_opi.iloc[4:8].sum()
+        if ttm_rev > 0 and prev_rev > 0:
+            m_now = ttm_opi / ttm_rev * 100
+            m_prev = prev_opi / prev_rev * 100
+            delta = m_now - m_prev
+            if delta >= 0.5: return (2, f"Op Margin +{delta:.1f}pp (TTM)")
+            if delta > -0.5: return (1, "Op Margin Stable (TTM)")
+            return (0, "Op Margin Falling (TTM)")
 
-    if None in (rev_ttm, rev_prev, op_ttm, op_prev) or rev_ttm == 0 or rev_prev == 0:
-        return (0, "Insufficient TTM data")
+    # 2. Fallback to Annual (Need 2 years)
+    a_rev = _safe_series(a_income, ["Total Revenue", "TotalRevenue"], 2)
+    a_opi = _safe_series(a_income, ["Operating Income", "OperatingIncome"], 2)
+    if a_rev is not None and len(a_rev) >= 2 and a_opi is not None and len(a_opi) >= 2:
+        rev_now = a_rev.iloc[0];
+        rev_prev = a_rev.iloc[1]
+        opi_now = a_opi.iloc[0];
+        opi_prev = a_opi.iloc[1]
+        if rev_now > 0 and rev_prev > 0:
+            m_now = opi_now / rev_now * 100
+            m_prev = opi_prev / rev_prev * 100
+            if m_now > m_prev: return (2, "Op Margin Rising (Annual)")
+            return (0, "Op Margin Falling (Annual)")
 
-    op_delta = (op_ttm / rev_ttm - op_prev / rev_prev) * 100
-    if op_delta >= 1.0: return (2, f"Op Margin +{op_delta:.2f}pp")
-    if op_delta >= 0.0: return (1, f"Op Margin stable (+{op_delta:.2f}pp)")
-    return (0, "Margin deterioration")
+    return (0, "No Margin Trend Data")
 
 
-def _fund_cashflow_reversal(q_cf: pd.DataFrame, q_income: pd.DataFrame) -> Tuple[int, str]:
-    ocf = _safe_series(q_cf, ["Operating Cash Flow", "Total Cash From Operating Activities"], 8)
-    cap = _safe_series(q_cf, ["Capital Expenditure", "CapitalExpenditure"], 8)
-    if ocf is None or cap is None: return (0, "Missing CF data")
+def _fund_cashflow_trend(q_cf: pd.DataFrame, a_cf: pd.DataFrame) -> Tuple[int, str]:
+    # 1. Try Quarterly TTM
+    q_ocf = _safe_series(q_cf, ["Operating Cash Flow", "Total Cash From Operating Activities"], 8)
+    if q_ocf is not None and len(q_ocf) >= 8:
+        ocf_now = q_ocf.iloc[:4].sum()
+        ocf_prev = q_ocf.iloc[4:8].sum()
+        return _calc_trend_score(ocf_now, ocf_prev, "OCF (TTM)")
 
-    ocf_ttm, ocf_prev = _ttm_and_prev_ttm(ocf)
-    cap_ttm, cap_prev = _ttm_and_prev_ttm(cap)
+    # 2. Fallback Annual
+    a_ocf = _safe_series(a_cf, ["Operating Cash Flow", "Total Cash From Operating Activities"], 2)
+    if a_ocf is not None and len(a_ocf) >= 2:
+        return _calc_trend_score(a_ocf.iloc[0], a_ocf.iloc[1], "OCF (Annual)")
 
-    if None in (ocf_ttm, ocf_prev): return (0, "Insufficient CF data")
-
-    fcf_ttm = ocf_ttm + (cap_ttm or 0)
-    fcf_prev = ocf_prev + (cap_prev or 0)
-
-    if fcf_ttm > 0 and fcf_ttm > fcf_prev: return (2, "FCF Positive & Growing")
-    if fcf_ttm > fcf_prev: return (1, "FCF Improving (still neg or weak)")
-    return (0, "FCF Declining")
+    return (0, "No CF Trend Data")
 
 
 def _fund_balance_sheet_healing(annual_bs: pd.DataFrame) -> Tuple[int, str]:
     if annual_bs is None or annual_bs.empty: return (0, "Missing BS")
     debt = _safe_series(annual_bs, ["Total Debt", "TotalDebt"], 2)
     cash = _safe_series(annual_bs, ["Cash And Cash Equivalents"], 2)
-
     if debt is not None and cash is not None and len(debt) >= 2:
         nd_now = debt.iloc[0] - cash.iloc[0]
         nd_prev = debt.iloc[1] - cash.iloc[1]
         if nd_now < nd_prev: return (2, "Net Debt Decreasing")
         if nd_now < 0: return (2, "Net Cash Position")
-    return (0, "Debt flat/increasing")
+        if nd_now < nd_prev * 1.05: return (1, "Net Debt Stable")
+    return (0, "Debt Increasing")
 
 
-def _fund_roic_inflection(metrics: Dict[str, Any]) -> Tuple[int, str]:
+def _fund_roic_check(metrics: Dict[str, Any]) -> Tuple[int, str]:
     roic = metrics.get("ROIC % (standardized)")
     if roic is None: return (0, "NA")
-    if roic > 15: return (2, f"ROIC High ({roic:.1f}%)")
-    if roic > 8: return (1, f"ROIC Stable ({roic:.1f}%)")
+    if roic > 12: return (2, f"ROIC Strong ({roic:.1f}%)")
+    if roic > 6: return (1, f"ROIC Stable ({roic:.1f}%)")
     return (0, f"ROIC Weak ({roic:.1f}%)")
 
 
-def _fund_value_divergence(metrics: Dict[str, Any]) -> Tuple[int, str]:
-    ev_ebit = metrics.get("EV/EBIT")
-    if ev_ebit is None: return (0, "NA")
-    if ev_ebit < 10: return (2, f"Cheap (EV/EBIT {ev_ebit:.1f}x)")
-    if ev_ebit < 18: return (1, f"Fair (EV/EBIT {ev_ebit:.1f}x)")
-    return (0, f"Expensive ({ev_ebit:.1f}x)")
+def _fund_value_check(metrics: Dict[str, Any]) -> Tuple[int, str]:
+    val = metrics.get("EV/EBIT")
+    if val is None: return (0, "NA")
+    if val < 12: return (2, f"Value (EV/EBIT {val:.1f}x)")
+    if val < 20: return (1, f"Fair (EV/EBIT {val:.1f}x)")
+    return (0, f"Rich (EV/EBIT {val:.1f}x)")
 
 
 # ==========================
 # Technical Confirmation
 # ==========================
-def _tech_price_above_200(hist: pd.DataFrame) -> Tuple[int, str]:
+def _tech_ma_trend(hist: pd.DataFrame) -> Tuple[int, str]:
     close = _get_close_series(hist)
-    if len(close) < 200: return (0, "No Data")
+    if len(close) < 200: return (0, "No Data (<200d)")
     ma200 = close.rolling(200).mean().iloc[-1]
-    curr = close.iloc[-1]
-    if curr > ma200 * 1.01: return (2, "Price > MA200")
-    if curr > ma200: return (1, "Testing MA200")
-    return (0, "Below MA200")
+    price = close.iloc[-1]
+    if price > ma200: return (2, "Price > 200d MA")
+    if price > ma200 * 0.95: return (1, "Testing 200d MA")
+    return (0, "Below 200d MA")
 
 
-def _tech_ma_structure(hist: pd.DataFrame) -> Tuple[int, str]:
-    close = _get_close_series(hist)
-    if len(close) < 200: return (0, "No Data")
-    ma50 = close.rolling(50).mean().iloc[-1]
-    ma200 = close.rolling(200).mean().iloc[-1]
-    if ma50 > ma200: return (2, "Golden Cross (50>200)")
-    return (0, "Bearish Structure")
-
-
-def _tech_rsi(hist: pd.DataFrame) -> Tuple[int, str]:
+def _tech_rsi_mom(hist: pd.DataFrame) -> Tuple[int, str]:
     close = _get_close_series(hist)
     if len(close) < 20: return (0, "No Data")
     delta = close.diff()
@@ -138,8 +150,7 @@ def _tech_rsi(hist: pd.DataFrame) -> Tuple[int, str]:
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs)).iloc[-1]
-
-    if rsi > 50: return (2, f"Bullish Momentum (RSI {rsi:.0f})")
+    if rsi > 50: return (2, f"Bullish (RSI {rsi:.0f})")
     if rsi > 40: return (1, f"Neutral (RSI {rsi:.0f})")
     return (0, f"Bearish (RSI {rsi:.0f})")
 
@@ -152,14 +163,23 @@ def _tech_drawdown(hist: pd.DataFrame) -> Tuple[int, str]:
     dd = (curr / peak - 1) * 100
     if dd > -15: return (2, f"Near Highs ({dd:.1f}%)")
     if dd > -30: return (1, f"Recovering ({dd:.1f}%)")
-    return (0, f"Deep Drawdown ({dd:.1f}%)")
+    return (0, f"In Drawdown ({dd:.1f}%)")
+
+
+def _tech_structure(hist: pd.DataFrame) -> Tuple[int, str]:
+    close = _get_close_series(hist)
+    if len(close) < 55: return (0, "No Data")
+    ma50 = close.rolling(50).mean().iloc[-1]
+    ma20 = close.rolling(20).mean().iloc[-1]
+    if ma20 > ma50: return (2, "Short-term Bullish (20>50)")
+    return (0, "Short-term Bearish")
 
 
 # ==========================
 # Main Scoring
 # ==========================
-FUND_WEIGHTS = {"Margins": 0.25, "Cashflow": 0.25, "Balance Sheet": 0.15, "ROIC": 0.15, "Valuation": 0.20}
-TECH_WEIGHTS = {"Trend (MA200)": 0.30, "Structure (50/200)": 0.20, "Momentum (RSI)": 0.25, "Drawdown": 0.25}
+FUND_WEIGHTS = {"Margins": 0.3, "Cashflow": 0.3, "Balance Sheet": 0.2, "ROIC": 0.1, "Valuation": 0.1}
+TECH_WEIGHTS = {"Trend (200d)": 0.4, "Momentum (RSI)": 0.2, "Drawdown": 0.2, "Structure": 0.2}
 
 
 def _calculate_weighted(items: Dict[str, Tuple[int, str]], weights: Dict[str, float]) -> float:
@@ -172,22 +192,20 @@ def _calculate_weighted(items: Dict[str, Tuple[int, str]], weights: Dict[str, fl
     return (score / total_w * 100.0) if total_w > 0 else 0.0
 
 
-def trend_reversal_scores_from_data(*, q_income=None, q_cf=None, annual_bs=None, h_1y=None, h_2y=None, metrics=None,
-                                    **kwargs) -> Dict[str, Any]:
-    # Fundamental
+def trend_reversal_scores_from_data(*, q_income=None, q_cf=None, annual_income=None, annual_cf=None, annual_bs=None,
+                                    h_1y=None, h_2y=None, metrics=None, **kwargs) -> Dict[str, Any]:
     fund = {}
-    fund["Margins"] = _fund_margin_stabilization(q_income)
-    fund["Cashflow"] = _fund_cashflow_reversal(q_cf, q_income)
+    fund["Margins"] = _fund_margin_trend(q_income, annual_income)
+    fund["Cashflow"] = _fund_cashflow_trend(q_cf, annual_cf)
     fund["Balance Sheet"] = _fund_balance_sheet_healing(annual_bs)
-    fund["ROIC"] = _fund_roic_inflection(metrics or {})
-    fund["Valuation"] = _fund_value_divergence(metrics or {})
+    fund["ROIC"] = _fund_roic_check(metrics or {})
+    fund["Valuation"] = _fund_value_check(metrics or {})
 
-    # Technical
     tech = {}
-    tech["Trend (MA200)"] = _tech_price_above_200(h_2y)
-    tech["Structure (50/200)"] = _tech_ma_structure(h_2y)
-    tech["Momentum (RSI)"] = _tech_rsi(h_1y)
+    tech["Trend (200d)"] = _tech_ma_trend(h_2y)
+    tech["Momentum (RSI)"] = _tech_rsi_mom(h_1y)
     tech["Drawdown"] = _tech_drawdown(h_1y)
+    tech["Structure"] = _tech_structure(h_1y)
 
     f_score = _calculate_weighted(fund, FUND_WEIGHTS)
     t_score = _calculate_weighted(tech, TECH_WEIGHTS)
@@ -202,14 +220,3 @@ def trend_reversal_scores_from_data(*, q_income=None, q_cf=None, annual_bs=None,
         "fund_details": {k: v for k, v in fund.items()},
         "tech_details": {k: v for k, v in tech.items()},
     }
-
-
-def trend_reversal_scores(tkr: yf.Ticker, metrics: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    return trend_reversal_scores_from_data(
-        q_income=tkr.quarterly_income_stmt,
-        q_cf=tkr.quarterly_cashflow,
-        annual_bs=tkr.balance_sheet,
-        h_1y=tkr.history(period="1y"),
-        h_2y=tkr.history(period="2y"),
-        metrics=metrics
-    )

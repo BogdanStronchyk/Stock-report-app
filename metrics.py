@@ -133,6 +133,14 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True, *, fmp_mode: 
         h3y = h10.loc[h10.index >= (h10.index.max() - pd.DateOffset(years=3))].copy()
     except:
         h3y = pd.DataFrame()
+    try:
+        h2y = h10.loc[h10.index >= (h10.index.max() - pd.DateOffset(years=2))].copy()
+    except:
+        h2y = pd.DataFrame()
+    try:
+        h1y = h10.loc[h10.index >= (h10.index.max() - pd.DateOffset(years=1))].copy()
+    except:
+        h1y = pd.DataFrame()
 
     price = safe_get(info, "currentPrice") or _fmp_get_num(fmp_data, "quote", "price")
     if price is None and not h10.empty: price = float(h10["Close"].iloc[-1])
@@ -210,6 +218,12 @@ def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True, *, fmp_mode: 
         "Net Debt / EBITDA": nd_ebitda, "Interest Coverage (EBIT / Interest)": int_cov,
         "Revenue per Share CAGR (5Y)": revps_cagr, "FCF per Share CAGR (5Y)": fcfps_cagr,
         "Max Drawdown (3–5Y)": max_dd,
-        "__yf_bundle__": {"info": info, "h10": h10}, "__notes__": {}
+        "__yf_bundle__": {
+            "info": info,
+            "h10": h10, "h2y": h2y, "h1y": h1y,
+            "q_income": q_income, "q_cf": q_cf, "annual_bs": annual_bs,
+            "annual_income": annual_income, "annual_cf": annual_cf
+        },
+        "__notes__": {}
     }
     return metrics
