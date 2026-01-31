@@ -26,6 +26,13 @@ _MULTIPLIERS = {
     "T": 1e12,
 }
 
+def ensure_df(val: Any) -> pd.DataFrame:
+    """
+    Safely returns the dataframe if it exists, otherwise returns an empty DataFrame.
+    Prevents 'truth value of a DataFrame is ambiguous' errors.
+    """
+    return val if val is not None else pd.DataFrame()
+
 
 def davf_protection_label(mos_pct: Optional[float], confidence: str) -> str:
     """
@@ -589,8 +596,7 @@ def compute_metrics_v2(
     sector_bucket = map_sector(sector, industry)
 
     # Price histories
-    h10 = _cached_df(f"hist:{ticker}:10y:1d", lambda: _history_retry(ticker, tkr, period="10y", interval="1d"))
-    if h10 is None: h10 = pd.DataFrame()
+    h10 = ensure_df(_cached_df(f"hist:{ticker}:10y:1d", lambda: _history_retry(ticker, tkr, period="10y", interval="1d")))
     h5 = _slice_history_from(h10, 5.0)
     h3y = _slice_history_from(h10, 3.0)
     h2y = _slice_history_from(h10, 2.0)
@@ -624,16 +630,12 @@ def compute_metrics_v2(
         shares_out = float(mcap) / float(price)
 
     # Statements
-    annual_income = _cached_df(f"stmt:{ticker}:income_stmt", lambda: yf_call(lambda: tkr.income_stmt))
-    if annual_income is None: annual_income = pd.DataFrame()
-    annual_bs = _cached_df(f"stmt:{ticker}:balance_sheet", lambda: yf_call(lambda: tkr.balance_sheet))
-    if annual_bs is None: annual_bs = pd.DataFrame()
-    annual_cf = _cached_df(f"stmt:{ticker}:cashflow", lambda: yf_call(lambda: tkr.cashflow))
-    if annual_cf is None: annual_cf = pd.DataFrame()
-    q_income = _cached_df(f"stmt:{ticker}:q_income", lambda: yf_call(lambda: tkr.quarterly_income_stmt))
-    if q_income is None: q_income = pd.DataFrame()
-    q_cf = _cached_df(f"stmt:{ticker}:q_cf", lambda: yf_call(lambda: tkr.quarterly_cashflow))
-    if q_cf is None: q_cf = pd.DataFrame()
+    # Patched to use ensure_df() instead of 'or pd.DataFrame()' to avoid ambiguity errors
+    annual_income = ensure_df(_cached_df(f"stmt:{ticker}:income_stmt", lambda: yf_call(lambda: tkr.income_stmt)))
+    annual_bs = ensure_df(_cached_df(f"stmt:{ticker}:balance_sheet", lambda: yf_call(lambda: tkr.balance_sheet)))
+    annual_cf = ensure_df(_cached_df(f"stmt:{ticker}:cashflow", lambda: yf_call(lambda: tkr.cashflow)))
+    q_income = ensure_df(_cached_df(f"stmt:{ticker}:q_income", lambda: yf_call(lambda: tkr.quarterly_income_stmt)))
+    q_cf = ensure_df(_cached_df(f"stmt:{ticker}:q_cf", lambda: yf_call(lambda: tkr.quarterly_cashflow)))
 
     # --- MANUAL RAW DATA EXTRACTION (Reliable) ---
     # TTM Data
