@@ -1,12 +1,15 @@
 from typing import Any, Dict, List, Optional, Tuple
 import math
+
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment
+
 from config import FILL_HDR, FONT_HDR, ALIGN_CENTER, ALIGN_WRAP, FILL_GREEN, FILL_YELLOW, FILL_RED, FILL_GRAY
 from checklist_loader import get_threshold_set, parse_range_cell
 from scoring import score_with_threshold_txt, compute_category_score_and_coverage, adjusted_from_raw_and_coverage
 
+# --- CORE 12 WHITELIST ---
 WHITELIST = {
     "P/E (TTM, positive EPS)", "EV/EBIT", "FCF Yield (TTM FCF / Market Cap)",
     "Gross Margin %", "Operating Margin %", "ROIC % (standardized)",
@@ -16,6 +19,7 @@ WHITELIST = {
 }
 
 
+# --- HELPERS ---
 def _is_percent_like_metric(metric: str) -> bool:
     m = metric.lower()
     return "%" in metric or "yield" in m or "margin" in m or "drawdown" in m or "roic" in m
@@ -54,15 +58,11 @@ def final_recommendation_banner(cat_scores: Dict[str, Optional[float]], reversal
     """Logic: Every separate fundamental category score >= threshold AND Reversal >= threshold."""
     scores = {k: (v if v is not None else 0.0) for k, v in cat_scores.items()}
     rev = reversal_total if reversal_total is not None else 0.0
-
-    # Check if all fundamental categories and reversal score meet the UI-defined threshold
     if all(s >= threshold for s in scores.values()) and rev >= threshold:
         return (f"✅ STRONG BUY ({int(threshold)}% Threshold)", FILL_GREEN)
-
     avg_fund = sum(scores.values()) / len(scores) if scores else 0
     if avg_fund >= threshold and rev < threshold:
         return ("⚠ WATCH — High Fundamentals, waiting for technicals", FILL_YELLOW)
-
     return ("❌ AVOID — Significant Fundamental Risks", FILL_RED) if any(s < 30 for s in scores.values()) else (
         "⚠ HOLD / NEUTRAL", FILL_YELLOW)
 
@@ -104,6 +104,25 @@ def _write_reversal_block(ws, start_row: int, title: str, symbols: Dict[str, str
     return start_row + 1
 
 
+def autosize_columns(ws):
+    """NEW: Adjusts column widths based on the longest string in each column."""
+    for col in ws.columns:
+        max_length = 0
+        column = get_column_letter(col[0].column)
+        for cell in col:
+            try:
+                if cell.value:
+                    # Calculate length and add a small buffer
+                    val_len = len(str(cell.value))
+                    if val_len > max_length:
+                        max_length = val_len
+            except:
+                pass
+        # Set width with a minimum of 10 and maximum of 60 to prevent extreme outliers
+        adjusted_width = max(min(max_length + 3, 60), 10)
+        ws.column_dimensions[column].width = adjusted_width
+
+
 def create_report_workbook(tickers: List[str], thresholds: Dict[str, Dict[str, Dict[str, Any]]],
                            metrics_by_ticker: Dict[str, Dict[str, Any]], reversal_by_ticker: Dict[str, Dict[str, Any]],
                            out_path: str, target_threshold: float = 60.0):
@@ -114,8 +133,10 @@ def create_report_workbook(tickers: List[str], thresholds: Dict[str, Dict[str, D
         ["Ticker", "Sector", "Avg Fund Score", "Reversal Score", "Recommendation", "Valuation", "Quality", "Safety",
          "Growth", "Risk", "Coverage %"])
     for c in ws_sum[1]: c.fill = FILL_HDR; c.font = FONT_HDR; c.alignment = ALIGN_CENTER
+
     category_maps = {"Valuation": "Valuation", "Profitability": "Quality", "Balance Sheet": "Safety",
                      "Growth": "Growth", "Risk": "Risk"}
+
     for t in tickers:
         m = metrics_by_ticker.get(t, {});
         revpack = _normalize_reversal_pack(reversal_by_ticker.get(t, {}))
@@ -125,6 +146,7 @@ def create_report_workbook(tickers: List[str], thresholds: Dict[str, Dict[str, D
         ws.merge_cells("A1:C1");
         ws["A1"].font = Font(size=14, bold=True)
         cat_scores, cat_coverages, row = {}, {}, 3
+
         for cat_sheet, cat_display in category_maps.items():
             ws.cell(row, 1, cat_display).font = Font(bold=True, size=12);
             ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6);
@@ -158,10 +180,12 @@ def create_report_workbook(tickers: List[str], thresholds: Dict[str, Dict[str, D
             cat_scores[cat_display], cat_coverages[cat_display] = adj, cov
             ws.cell(row, 1, f"{cat_display} Adjusted: {adj:.1f}%" if adj is not None else "NA").font = Font(bold=True);
             row += 2
+
         rev_total = revpack.get("total_score_pct")
         rec_txt, rec_fill = final_recommendation_banner(cat_scores, rev_total, target_threshold)
         valid_cats = [s for s in cat_scores.values() if s is not None]
         avg_f = sum(valid_cats) / len(valid_cats) if valid_cats else 0.0
+
         ws["D1"] = "Avg Fund Score";
         ws["E1"] = avg_f;
         ws["E1"].fill = band_fill(avg_f)
@@ -171,11 +195,19 @@ def create_report_workbook(tickers: List[str], thresholds: Dict[str, Dict[str, D
         ws["A2"] = "Recommendation";
         ws["B2"] = rec_txt;
         ws["B2"].fill = rec_fill
+
         avg_cov = sum(cat_coverages.values()) / len(cat_coverages) if cat_coverages else 0
         ws_sum.append([t, bucket, avg_f, rev_total, rec_txt, cat_scores.get("Valuation"), cat_scores.get("Quality"),
                        cat_scores.get("Safety"), cat_scores.get("Growth"), cat_scores.get("Risk"), avg_cov])
+
         row = _write_reversal_block(ws, row, "Fundamental Turnaround", revpack.get("fund_symbols", {}),
                                     revpack.get("fund_details", {}), revpack.get("fund_score_pct"))
         row = _write_reversal_block(ws, row, "Technical Confirmation", revpack.get("tech_symbols", {}),
                                     revpack.get("tech_details", {}), revpack.get("tech_score_pct"))
+
+        # Apply autosizing to the individual ticker sheet
+        autosize_columns(ws)
+
+    # Apply autosizing to the Summary sheet
+    autosize_columns(ws_sum)
     wb.save(out_path)
