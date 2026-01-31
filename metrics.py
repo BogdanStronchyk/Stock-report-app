@@ -13,7 +13,6 @@ _MULTIPLIERS = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}
 
 
 def ensure_df(val: Any) -> pd.DataFrame:
-    """Safely returns the dataframe if it exists, otherwise returns an empty DataFrame."""
     return val if val is not None else pd.DataFrame()
 
 
@@ -101,7 +100,7 @@ def approx_roic_percent(annual_income: pd.DataFrame, annual_bs: pd.DataFrame) ->
     if ebit is None or total_assets is None or curr_liab is None: return None
     invested = float(total_assets) - float(curr_liab)
     if invested <= 0: return None
-    return (float(ebit) * 0.79 / invested) * 100.0  # 21% Tax assumption
+    return (float(ebit) * 0.79 / invested) * 100.0
 
 
 def compute_metrics_v2(ticker: str, use_fmp_fallback: bool = True, *, fmp_mode: str = "full",

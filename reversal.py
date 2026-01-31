@@ -1,6 +1,5 @@
 import math
 from typing import Any, Dict, Optional, Tuple
-import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -36,11 +35,6 @@ def _get_close_series(hist: pd.DataFrame) -> pd.Series:
 def _ttm_and_prev_ttm(series: pd.Series) -> Tuple[Optional[float], Optional[float]]:
     if series is None or series.dropna().shape[0] < 8: return (None, None)
     return (_to_num(series.iloc[:4].sum()), _to_num(series.iloc[4:8].sum()))
-
-
-def _pct_change(curr: Optional[float], prev: Optional[float]) -> Optional[float]:
-    if curr is None or prev is None or prev == 0: return None
-    return (curr / prev - 1.0) * 100.0
 
 
 def _score_symbol(points: int) -> str:
@@ -164,12 +158,8 @@ def _tech_drawdown(hist: pd.DataFrame) -> Tuple[int, str]:
 # ==========================
 # Main Scoring
 # ==========================
-FUND_WEIGHTS = {
-    "Margins": 0.25, "Cashflow": 0.25, "Balance Sheet": 0.15, "ROIC": 0.15, "Valuation": 0.20
-}
-TECH_WEIGHTS = {
-    "Trend (MA200)": 0.30, "Structure (50/200)": 0.20, "Momentum (RSI)": 0.25, "Drawdown": 0.25
-}
+FUND_WEIGHTS = {"Margins": 0.25, "Cashflow": 0.25, "Balance Sheet": 0.15, "ROIC": 0.15, "Valuation": 0.20}
+TECH_WEIGHTS = {"Trend (MA200)": 0.30, "Structure (50/200)": 0.20, "Momentum (RSI)": 0.25, "Drawdown": 0.25}
 
 
 def _calculate_weighted(items: Dict[str, Tuple[int, str]], weights: Dict[str, float]) -> float:
@@ -215,7 +205,6 @@ def trend_reversal_scores_from_data(*, q_income=None, q_cf=None, annual_bs=None,
 
 
 def trend_reversal_scores(tkr: yf.Ticker, metrics: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    # Fetch fallback if called directly
     return trend_reversal_scores_from_data(
         q_income=tkr.quarterly_income_stmt,
         q_cf=tkr.quarterly_cashflow,

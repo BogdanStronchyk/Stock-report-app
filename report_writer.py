@@ -134,7 +134,7 @@ def _write_reversal_block(ws, start_row: int, title: str, symbols: Dict[str, str
 def autosize_columns(ws):
     for col in ws.columns:
         max_length = 0
-        column = get_column_letter(col[0].column)
+        column = get_column_letter(col[0].column)  # Safer than .column_letter for merged cells
         for cell in col:
             try:
                 if len(str(cell.value)) > max_length: max_length = len(str(cell.value))
