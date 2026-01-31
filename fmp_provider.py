@@ -19,13 +19,10 @@ class FMPClient:
 
         https://financialmodelingprep.com/stable/<endpoint>?symbol=SYMBOL&apikey=...
 
-    If you see HTTP 400/403 responses, the JSON body usually explains whether the
-    issue is a plan restriction, an invalid symbol, or a bad/expired key.
-
     Performance/budget features:
       - Optional on-disk cache (default ON, TTL 24h) to avoid repeat calls.
-      - Optional request budget per run (FMP_MAX_REQUESTS) to prevent exploding call counts.
-      - Simple retry/backoff on transient network errors and HTTP 429.
+      - Optional request budget per run (FMP_MAX_REQUESTS).
+      - STRICT MINIMALISM: No retries, no fallbacks, early exit on bad tickers.
     """
 
     def __init__(self, api_key: Optional[str] = None, timeout: int = 25):
@@ -38,34 +35,39 @@ class FMPClient:
         self.last_error = None
         self.last_status = None
 
-        # Budget controls (per run)
-        # If set (int > 0), hard-stops further calls once request_count reaches the limit.
+        # Budget controls
         self.max_requests = self._safe_int(os.environ.get("FMP_MAX_REQUESTS", ""), default=0)
 
         # Cache controls
         self.cache_enabled = (os.environ.get("FMP_USE_CACHE", "1") or "1").strip().lower() not in ("0", "false", "no")
         self.cache_ttl_hours = self._safe_float(os.environ.get("FMP_CACHE_TTL_HOURS", "24"), default=24.0)
 
-        # Retry controls
-        self.max_retries = self._safe_int(os.environ.get("FMP_MAX_RETRIES", "2"), default=2)  # extra attempts
-        self.backoff_base = self._safe_float(os.environ.get("FMP_BACKOFF_BASE", "1.2"), default=1.2)
+        # Retry controls: Default to 0 to protect quota
+        self.max_retries = self._safe_int(os.environ.get("FMP_MAX_RETRIES", "0"), default=0)
+        self.backoff_base = self._safe_float(os.environ.get("FMP_BACKOFF_BASE", "1.5"), default=1.5)
 
-        # Many plans restrict quarterly statements. Default to annual-only unless explicitly enabled.
+        # Plan restrictions
         self.use_quarterly = (os.environ.get("FMP_USE_QUARTERLY", "0") or "0").strip().lower() in ("1", "true", "yes")
-
-        # Statement pagination limits
-        #
-        # Some subscriptions restrict the allowed values for the `limit` parameter (commonly <= 5).
-        # Keep this configurable but capped to 5 by default to avoid HTTP 402 "Premium Query Parameter" errors.
         self.statement_limit = self._safe_int(os.environ.get("FMP_STATEMENT_LIMIT", "5"), default=5)
-        # Hard cap at 5 unless you change code (matches your current plan restriction).
         self.statement_limit = max(0, min(5, self.statement_limit))
 
-    def _cap_limit(self, desired: int) -> Optional[int]:
-        """Return a subscription-safe `limit` value.
+    def clean_ticker(self, symbol: str) -> str:
+        """Align Yahoo-style tickers to FMP format to avoid 400/404 errors."""
+        s = (symbol or "").strip().upper()
+        # 1. Forex: 'EURUSD=X' -> 'EURUSD'
+        if s.endswith("=X"):
+            s = s.replace("=X", "")
+        # 2. Crypto: 'BTC-USD' -> 'BTCUSD'
+        if s.endswith("-USD"):
+            s = s.replace("-", "")
+        # 3. US Share Classes: 'BRK.B' -> 'BRK-B'
+        if "." in s:
+            parts = s.split(".")
+            if len(parts) == 2 and parts[0].isalpha() and len(parts[1]) == 1:
+                return s.replace(".", "-")
+        return s
 
-        If statement_limit <= 0, omit the `limit` parameter entirely (API default).
-        """
+    def _cap_limit(self, desired: int) -> Optional[int]:
         try:
             desired_i = int(desired)
         except Exception:
@@ -77,64 +79,40 @@ class FMPClient:
     @staticmethod
     def _safe_int(v: str, default: int = 0) -> int:
         try:
-            v = (v or "").strip()
-            if not v:
-                return default
-            return int(float(v))
+            return int(float((v or "").strip()))
         except Exception:
             return default
 
     @staticmethod
     def _safe_float(v: str, default: float = 0.0) -> float:
         try:
-            v = (v or "").strip()
-            if not v:
-                return default
-            return float(v)
+            return float((v or "").strip())
         except Exception:
             return default
 
     # -----------------------
-    # URL builders
+    # URL / Cache
     # -----------------------
     def _stable_url(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> str:
         params = dict(params or {})
         params["apikey"] = self.api_key
         qs = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
-        base = (os.environ.get("FMP_BASE_URL") or "https://financialmodelingprep.com/stable/").strip()
-        base = base.rstrip("/")
+        base = (os.environ.get("FMP_BASE_URL") or "https://financialmodelingprep.com/stable/").strip().rstrip("/")
         endpoint = (endpoint or "").lstrip("/")
         return f"{base}/{endpoint}?{qs}"
 
-    # -----------------------
-    # Cache (disk)
-    # -----------------------
     def _cache_dir(self) -> str:
         return os.path.join(os.getcwd(), ".cache", "fmp")
 
-    def _cache_ttl_seconds(self) -> int:
-        return int(max(0.0, self.cache_ttl_hours) * 3600)
-
     def _cache_key(self, url: str) -> str:
-        # Hash full URL (includes apikey) to a stable filename.
         return hashlib.sha256(url.encode("utf-8", errors="ignore")).hexdigest() + ".json"
 
     def _cache_get(self, url: str) -> Optional[Any]:
-        if not self.cache_enabled:
-            return None
-        ttl = self._cache_ttl_seconds()
-        if ttl <= 0:
-            return None
-        cdir = self._cache_dir()
+        if not self.cache_enabled: return None
         try:
-            os.makedirs(cdir, exist_ok=True)
-        except Exception:
-            return None
-        path = os.path.join(cdir, self._cache_key(url))
-        try:
+            path = os.path.join(self._cache_dir(), self._cache_key(url))
             st = os.stat(path)
-            age = datetime.now().timestamp() - st.st_mtime
-            if age > ttl:
+            if (datetime.now().timestamp() - st.st_mtime) > (self.cache_ttl_hours * 3600):
                 return None
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
@@ -142,56 +120,36 @@ class FMPClient:
             return None
 
     def _cache_set(self, url: str, payload: Any) -> None:
-        if not self.cache_enabled:
-            return
-        cdir = self._cache_dir()
+        if not self.cache_enabled: return
         try:
+            cdir = self._cache_dir()
             os.makedirs(cdir, exist_ok=True)
             path = os.path.join(cdir, self._cache_key(url))
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(payload, f)
         except Exception:
-            # Cache must never break data fetch
-            return
+            pass
 
     # -----------------------
     # HTTP
     # -----------------------
-    def _budget_allows(self) -> bool:
-        return (self.max_requests <= 0) or (self.request_count < self.max_requests)
-
-    def _sleep_backoff(self, attempt: int, retry_after: Optional[float] = None) -> None:
-        if retry_after is not None and retry_after > 0:
-            time.sleep(retry_after)
-            return
-        # Exponential-ish backoff
-        delay = max(0.2, self.backoff_base ** max(0, attempt))
-        time.sleep(min(15.0, delay))
-
     def _get_json(self, url: str) -> Optional[Any]:
         if not self.enabled:
-            self.last_error = "FMP_API_KEY not set."
             return None
-
-        if not self._budget_allows():
-            self.last_error = "FMP request budget reached (FMP_MAX_REQUESTS)."
+        if self.max_requests > 0 and self.request_count >= self.max_requests:
+            self.last_error = "Budget limit reached."
             return None
 
         cached = self._cache_get(url)
         if cached is not None:
             self.last_status = 200
-            # Avoid confusing state like last_status=200 with a stale last_error from earlier.
             self.last_error = None
             return cached
 
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) StockReportApp/1.0",
-            "Accept": "application/json,text/plain,*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Connection": "close",
-        }
+        headers = {"User-Agent": "StockReportApp/1.0", "Connection": "close"}
 
-        for attempt in range(0, max(0, self.max_retries) + 1):
+        # Max retries loop (default 0 loops = 1 attempt total)
+        for attempt in range(max(1, self.max_retries + 1)):
             req = urllib.request.Request(url, headers=headers, method="GET")
             try:
                 self.request_count += 1
@@ -199,126 +157,55 @@ class FMPClient:
                     print(f"[FMP] GET {url}")
 
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    self.last_status = getattr(resp, "status", None)
+                    self.last_status = getattr(resp, "status", 200)
                     raw = resp.read().decode("utf-8", errors="ignore")
-                    if not raw:
-                        return None
+                    if not raw: return None
                     payload = json.loads(raw)
-                    # Successful call clears previous errors.
-                    self.last_error = None
                     self._cache_set(url, payload)
+                    self.last_error = None
                     return payload
 
             except urllib.error.HTTPError as e:
-                self.last_status = getattr(e, "code", None)
-
-                retry_after = None
-                try:
-                    ra = e.headers.get("Retry-After")
-                    if ra is not None:
-                        retry_after = float(str(ra).strip())
-                except Exception:
-                    retry_after = None
-
-                body = ""
-                try:
-                    body = e.read().decode("utf-8", errors="ignore")
-                except Exception:
-                    pass
-
-                # Best-effort parse of JSON error bodies (FMP often returns: {"Error Message": "..."}).
-                msg = None
-                if body:
-                    try:
-                        j = json.loads(body)
-                        if isinstance(j, dict):
-                            msg = j.get("Error Message") or j.get("error") or j.get("message")
-                    except Exception:
-                        msg = None
-
-                if e.code in (401, 403):
-                    base = f"HTTP {e.code} {'Unauthorized' if e.code == 401 else 'Forbidden'} from FMP"
-                    if msg:
-                        self.last_error = f"{base}: {msg}"
-                    else:
-                        self.last_error = (
-                            f"{base}. Possible causes: invalid/expired API key, plan restriction, "
-                            "or access blocked."
-                        )
-                    return None
-
-                if e.code == 429:
-                    self.last_error = "HTTP 429 Too Many Requests (rate-limited)."
-                    if attempt < self.max_retries:
-                        if self.debug:
-                            print(f"[FMP] 429 rate limit; sleeping (Retry-After={retry_after}) and retrying...")
-                        self._sleep_backoff(attempt, retry_after=retry_after)
-                        continue
-                    return None
-
-                # Other 5xx can be transient; retry a couple times
-                if e.code in (500, 502, 503, 504) and attempt < self.max_retries:
-                    self.last_error = f"HTTP {e.code} from FMP (transient). Retrying..."
-                    if self.debug:
-                        print(f"[FMP] {self.last_error}")
-                    self._sleep_backoff(attempt)
+                self.last_status = e.code
+                # 429 Rate Limit
+                if e.code == 429 and attempt < self.max_retries:
+                    time.sleep(1.0)  # Simple sleep
                     continue
-
-                if msg:
-                    self.last_error = f"HTTP {e.code} error from FMP: {msg}"
-                else:
-                    self.last_error = f"HTTP {e.code} error from FMP. Response: {body[:200]}"
-                if self.debug:
-                    print(f"[FMP] ERROR {e.code}: {self.last_error}")
+                # All other errors (400, 403, 404, 500) -> Abort immediately to save quota
+                self.last_error = f"HTTP {e.code}"
                 return None
-
-            except urllib.error.URLError as e:
-                self.last_error = f"Network error: {e}"
-                if attempt < self.max_retries:
-                    if self.debug:
-                        print(f"[FMP] {self.last_error} (retrying...)")
-                    self._sleep_backoff(attempt)
-                    continue
-                if self.debug:
-                    print(f"[FMP] ERROR: {self.last_error}")
-                return None
-
             except Exception as e:
                 self.last_error = str(e)
                 if attempt < self.max_retries:
-                    if self.debug:
-                        print(f"[FMP] ERROR: {self.last_error} (retrying...)")
-                    self._sleep_backoff(attempt)
+                    time.sleep(0.5)
                     continue
-                if self.debug:
-                    print(f"[FMP] ERROR: {self.last_error}")
                 return None
-
         return None
 
     # -----------------------
-    # Fetch bundle(s)
+    # Fetch (Strict Minimal)
     # -----------------------
     def fetch_minimal(
-        self,
-        symbol: str,
-        *,
-        need_profile: bool = True,
-        need_quote: bool = True,
-        need_income_annual: bool = False,
-        need_income_quarter: bool = False,
-        need_cashflow_quarter: bool = False,
-        need_balance_annual: bool = False,
-        need_enterprise_value: bool = False,
-        need_ratios_ttm: bool = False,
-        need_key_metrics_ttm: bool = True,
+            self,
+            symbol: str,
+            *,
+            need_profile: bool = True,
+            need_quote: bool = True,
+            need_income_annual: bool = False,
+            need_income_quarter: bool = False,
+            need_cashflow_quarter: bool = False,
+            need_balance_annual: bool = False,
+            need_enterprise_value: bool = False,
+            need_ratios_ttm: bool = False,
+            need_key_metrics_ttm: bool = True,
     ) -> Dict[str, Any]:
-        """Fetch only the endpoints you need (saves calls + time).
-
-        Returned keys match fetch_all() so downstream code can keep working.
-        Missing sections are returned as empty lists.
-        """
+        """Fetch endpoints with strict call minimization."""
         if not self.enabled:
+            return {}
+
+        # 1. Clean ticker (prevents 400s)
+        symbol = self.clean_ticker(symbol)
+        if not symbol:
             return {}
 
         data: Dict[str, Any] = {}
@@ -326,56 +213,55 @@ class FMPClient:
         def _get(endpoint: str, params: Dict[str, Any]) -> Optional[Any]:
             return self._get_json(self._stable_url(endpoint, params))
 
-        # Profile / Quote
-        data["profile"] = _get("profile", {"symbol": symbol}) or [] if need_profile else []
+        # 2. Fetch Profile First
+        # Optimization: If profile fails (invalid ticker), abort immediately to save calls.
+        if need_profile:
+            p = _get("profile", {"symbol": symbol})
+            data["profile"] = p or []
+
+            # EARLY EXIT: If we expected a profile but got nothing, the ticker is likely bad/delisted.
+            # Stop here to save the other ~6 calls.
+            if not data["profile"]:
+                if self.debug:
+                    print(f"[FMP] Aborting {symbol} (no profile found) to save quota.")
+                return data
+        else:
+            data["profile"] = []
+
+        # 3. Fetch Quote (Single Attempt)
         if need_quote:
-            q = _get("quote", {"symbol": symbol})
-            if q is None:
-                # Some plans expose quote-short but not full quote.
-                q = _get("quote-short", {"symbol": symbol})
-            data["quote"] = q or []
+            data["quote"] = _get("quote", {"symbol": symbol}) or []
         else:
             data["quote"] = []
 
-        # Statements / enterprise values
+        # 4. Fetch Statements (Single Attempt - No Fallbacks)
+        # We assume strict compliance with FMP plans (e.g. Annual default).
         if need_income_annual:
-            ia = _get("income-statement", {"symbol": symbol, "period": "annual", "limit": self._cap_limit(6)})
-            if ia is None:
-                ia = _get("income-statement", {"symbol": symbol, "limit": self._cap_limit(6)})
-            data["income_a"] = ia or []
+            data["income_a"] = _get("income-statement",
+                                    {"symbol": symbol, "period": "annual", "limit": self._cap_limit(6)}) or []
         else:
             data["income_a"] = []
 
         if need_income_quarter:
-            iq = _get("income-statement", {"symbol": symbol, "period": "quarter", "limit": self._cap_limit(8)})
-            if iq is None:
-                # Fallback to annual if quarterly is restricted.
-                iq = _get("income-statement", {"symbol": symbol, "period": "annual", "limit": self._cap_limit(8)})
-            data["income_q"] = iq or []
+            data["income_q"] = _get("income-statement",
+                                    {"symbol": symbol, "period": "quarter", "limit": self._cap_limit(8)}) or []
         else:
             data["income_q"] = []
 
         if need_cashflow_quarter:
-            cq = _get("cash-flow-statement", {"symbol": symbol, "period": "quarter", "limit": self._cap_limit(8)})
-            if cq is None:
-                cq = _get("cash-flow-statement", {"symbol": symbol, "period": "annual", "limit": self._cap_limit(8)})
-            data["cashflow_q"] = cq or []
+            data["cashflow_q"] = _get("cash-flow-statement",
+                                      {"symbol": symbol, "period": "quarter", "limit": self._cap_limit(8)}) or []
         else:
             data["cashflow_q"] = []
 
         if need_balance_annual:
-            ba = _get("balance-sheet-statement", {"symbol": symbol, "period": "annual", "limit": self._cap_limit(2)})
-            if ba is None:
-                ba = _get("balance-sheet-statement", {"symbol": symbol, "limit": self._cap_limit(2)})
-            data["balance_a"] = ba or []
+            data["balance_a"] = _get("balance-sheet-statement",
+                                     {"symbol": symbol, "period": "annual", "limit": self._cap_limit(2)}) or []
         else:
             data["balance_a"] = []
 
         if need_enterprise_value:
-            ev = _get("enterprise-values", {"symbol": symbol, "limit": self._cap_limit(2)})
-            if ev is None:
-                ev = _get("enterprise-values", {"symbol": symbol})
-            data["enterprise_value"] = ev or []
+            data["enterprise_value"] = _get("enterprise-values", {"symbol": symbol, "limit": self._cap_limit(2)}) or []
         else:
             data["enterprise_value"] = []
 
@@ -386,14 +272,7 @@ class FMPClient:
         return data
 
     def fetch_bundle(self, symbol: str, *, mode: str = "full") -> Dict[str, Any]:
-        """Budget-aware fetch wrapper.
-
-        mode:
-          - off         : returns {}
-          - conditional : quote + profile (+ key_metrics_ttm). No statements.
-          - minimal     : quote + profile + key_metrics_ttm + ratios_ttm + enterprise_value. No statements.
-          - full        : original fetch_all() bundle (statements + ratios + key metrics).
-        """
+        """Budget-aware fetch wrapper."""
         mode = (mode or "full").strip().lower()
         if mode in ("off", "0", "false", "no"):
             return {}
@@ -419,10 +298,6 @@ class FMPClient:
         return self.fetch_all(symbol)
 
     def fetch_all(self, symbol: str) -> Dict[str, Any]:
-        """Full bundle (kept for backwards compatibility).
-
-        NOTE: This is stable-only (no legacy `/api/v3/...` calls).
-        """
         return self.fetch_minimal(
             symbol,
             need_profile=True,
