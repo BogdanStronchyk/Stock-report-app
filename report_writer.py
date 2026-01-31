@@ -131,6 +131,25 @@ def _write_reversal_block(ws, start_row: int, title: str, symbols: Dict[str, str
     return start_row + 1
 
 
+def autosize_columns(ws):
+    """Adjusts column width to fit content, with min/max limits."""
+    for col in ws.columns:
+        max_length = 0
+        # FIX: MergedCell doesn't have .column_letter, use utils helper instead
+        column = get_column_letter(col[0].column)
+
+        for cell in col:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+
+        adjusted_width = min(max_length + 2, 60)
+        adjusted_width = max(adjusted_width, 10)
+        ws.column_dimensions[column].width = adjusted_width
+
+
 # ==========================================
 # MAIN REPORT GENERATOR
 # ==========================================
@@ -156,9 +175,10 @@ def create_report_workbook(tickers: List[str], thresholds: Dict[str, Dict[str, D
 
         ws = wb.create_sheet(t)
 
-        # --- FIX: MERGE ONLY A1:C1 (Leaves D1 open for Dashboard) ---
+        # --- TITLE BLOCK ---
         ws["A1"] = f"{t} — {bucket}"
         ws.merge_cells("A1:C1")
+        ws["A1"].font = Font(size=14, bold=True)
 
         # --- DETAILED TABLES ---
         cat_scores = {}
@@ -167,6 +187,7 @@ def create_report_workbook(tickers: List[str], thresholds: Dict[str, Dict[str, D
 
         for cat_sheet, cat_display in category_maps.items():
             ws.cell(row, 1).value = cat_display
+            ws.cell(row, 1).font = Font(bold=True, size=12)
             ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
             row += 1
 
@@ -191,7 +212,6 @@ def create_report_workbook(tickers: List[str], thresholds: Dict[str, Dict[str, D
                 rating = "NA";
                 fill = FILL_GRAY
                 if th and val is not None:
-                    # FIX: Unpack only 2 values
                     rating, fill = score_with_threshold_txt(val, th.get("green_txt"), th.get("yellow_txt"),
                                                             th.get("red_txt"))
 
@@ -223,7 +243,7 @@ def create_report_workbook(tickers: List[str], thresholds: Dict[str, Dict[str, D
         rev_total = revpack.get("total_score_pct")
         rec_txt, rec_fill = final_recommendation_banner(fund_score, rev_total)
 
-        # --- DASHBOARD (Safe now that A1:F1 isn't merged) ---
+        # --- DASHBOARD ---
         ws["D1"] = "Fundamental Score";
         ws["E1"] = fund_score;
         ws["E1"].fill = band_fill(fund_score)
@@ -248,11 +268,7 @@ def create_report_workbook(tickers: List[str], thresholds: Dict[str, Dict[str, D
         row = _write_reversal_block(ws, row, "Technical Confirmation", revpack.get("tech_symbols", {}),
                                     revpack.get("tech_details", {}), revpack.get("tech_score_pct"))
 
-        # Autosize
-        for col in ws.columns:
-            ws.column_dimensions[get_column_letter(col[0].column)].width = 22
+        autosize_columns(ws)
 
-    for col in ws_sum.columns:
-        ws_sum.column_dimensions[get_column_letter(col[0].column)].width = 18
-
+    autosize_columns(ws_sum)
     wb.save(out_path)
